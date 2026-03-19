@@ -477,7 +477,8 @@ const getCommanAuthDetailOnEveryHit = async (req, res) => {
       Msg: "Token fetched successfully",
       source: authRecord?.activeSession?.source || null,
 
-      MobileNo: authRecord?.driverContact || null,
+      // ✅ MobileNo → ALWAYS string
+      MobileNo: authRecord.mobileNo != null ? String(authRecord.mobileNo) : null,
 
       // Wise Token (B2B)
       Token: b2bToken || null,
@@ -488,8 +489,11 @@ const getCommanAuthDetailOnEveryHit = async (req, res) => {
       CarType: authRecord?.wiseCarType || null,
       OTP: null,
       IsOnDuty: authRecord?.wiseIsOnDuty ?? null,
-      VendorID: authRecord?.wiseVendorId ?? null,
-      BranchID: authRecord?.wiseBranchId ?? null,
+      // VendorID: authRecord?.wiseVendorId ?? null,
+      // BranchID: authRecord?.wiseBranchId ?? null,
+
+      VendorID: authRecord.vendorId != null ? Number(authRecord.vendorId) : 0,
+      BranchID: authRecord.branchId != null ? Number(authRecord.branchId) : 0,
     };
 
     // Add B2C token separately (MMT token)
@@ -747,5 +751,5 @@ module.exports = {
   createOrUpdateConfig,
 
   getCommanAuthDetailOnEveryHit,
-  autoLoginToB2BIfExistInMMT
+  autoLoginToB2BIfExistInMMT,
 };
