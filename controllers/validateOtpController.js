@@ -334,4 +334,4 @@ const verifyWiseOtp = async (userId, otp, gcm) => {
   }
 };
 
-module.exports = { validateOtp };
+module.exports = { validateOtp, verifyWiseOtp };

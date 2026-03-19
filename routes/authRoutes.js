@@ -4,6 +4,7 @@ const {
   checkWhenToSwitchToB2BApp,
   createOrUpdateConfig,
   loginCommonForDriver,
+  getCommanAuthDetailOnEveryHit
 } = require("../controllers/loginController");
 
 const { validateOtp } = require("../controllers/validateOtpController");
@@ -26,5 +27,8 @@ DriverAppAuthRouter.post("/login-common-driver", loginCommonForDriver);
 
 // validate after login
 DriverAppAuthRouter.post("/validate-common-otp", validateOtp);
+
+// 
+DriverAppAuthRouter.post("/get-comman-auth-detail-on-every-hit", getCommanAuthDetailOnEveryHit);
 
 module.exports = DriverAppAuthRouter; // Export the router instance directly

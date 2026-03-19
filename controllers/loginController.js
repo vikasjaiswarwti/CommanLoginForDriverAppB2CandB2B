@@ -7,6 +7,7 @@ const { Driver } = require("../models/DriverModel");
 const { Vehicle } = require("../models/VehicleModel");
 const { Mobileotp } = require("../models/MobileOtp");
 const axios = require("axios");
+const { verifyWiseOtp } = require("./validateOtpController");
 
 // ─────────────────────────────────────────────
 // Config endpoints
@@ -428,8 +429,323 @@ const generateOtpMobile = async (mobile, VehicleNumber) => {
   }
 };
 
+const getCommanAuthDetailOnEveryHit = async (req, res) => {
+  try {
+    const { vehicleNumber, btobtoken, btoctoken } = req.body;
+
+    if (!vehicleNumber) {
+      return res.status(400).json({
+        success: false,
+        message: "vehicleNumber is required and must be a string",
+        code: "INVALID_VEHICLE_NUMBER",
+      });
+    }
+
+    const normalizedVehicle = vehicleNumber.toLowerCase().replace(/\s/g, "");
+
+    const authRecord = await AuthModelForCommonDApp.findOne({
+      vehicleNumber: normalizedVehicle,
+    }).sort({ createdAt: -1 });
+
+    if (!authRecord) {
+      return res.status(404).json({
+        success: false,
+        message: "No auth record found",
+      });
+    }
+
+    let b2bToken = btobtoken;
+    let b2cToken = btoctoken;
+
+    // If B2C token is null → take from DB
+    if (!b2cToken && authRecord?.b2c?.token) {
+      b2cToken = authRecord.b2c.token;
+    }
+
+    // If B2B token is null → take from DB
+    if (!b2bToken && authRecord?.b2b?.token) {
+      b2bToken = authRecord.b2b.token;
+    }
+
+    // ─────────────────────────────────────────────
+    // Prepare response (same as validateOtp format)
+    // ─────────────────────────────────────────────
+
+    const finalResponse = {
+      success: true,
+      Code: 1,
+      Msg: "Token fetched successfully",
+      source: authRecord?.activeSession?.source || null,
+
+      MobileNo: authRecord?.driverContact || null,
+
+      // Wise Token (B2B)
+      Token: b2bToken || null,
+
+      AllocationID: authRecord?.wiseAllocationId ?? null,
+      CabID: authRecord?.wiseCabId ?? null,
+      CabNo: authRecord?.driver?.name || null,
+      CarType: authRecord?.wiseCarType || null,
+      OTP: null,
+      IsOnDuty: authRecord?.wiseIsOnDuty ?? null,
+      VendorID: authRecord?.wiseVendorId ?? null,
+      BranchID: authRecord?.wiseBranchId ?? null,
+    };
+
+    // Add B2C token separately (MMT token)
+    if (b2cToken) {
+      finalResponse.b2cToken = b2cToken;
+    }
+
+    return res.status(200).json(finalResponse);
+  } catch (error) {
+    console.error("getCommanAuthDetailOnEveryHit Error:", error.message);
+    return res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+};
+
+const autoLoginToB2BIfExistInMMT = async (req, res) => {
+  try {
+    const { vehicleNumber } = req.body;
+
+    if (!vehicleNumber?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Vehicle number is required",
+      });
+    }
+
+    const normalizedVehicle = vehicleNumber.toLowerCase().replace(/\s/g, "");
+
+    // ── STEP 1: Check if vehicle exists in MMT ───────────────────────────────
+    const foundVehicle = await Vehicle.findOne({
+      VehicleNumber: normalizedVehicle,
+    });
+
+    if (!foundVehicle) {
+      return res.status(404).json({
+        success: false,
+        message: "Vehicle not found in MMT system",
+        neverLoggedAsB2C: true,
+      });
+    }
+
+    // ── STEP 2: Get GCM from auth model ─────────────────────────────────────
+    const authRecord = await AuthModelForCommonDApp.findOne({
+      vehicleNumber: normalizedVehicle,
+    }).sort({ createdAt: -1 });
+
+    const gcm = authRecord?.wiseGcm || null;
+
+    // ── STEP 3: Check if driver has ever logged in as B2C ───────────────────
+    const hasB2CHistory = await DriverLoginHistory.findOne({
+      vehicleNumber: normalizedVehicle,
+      source: { $in: ["mmt", "both"] },
+      action: "login_success",
+    });
+
+    if (!hasB2CHistory) {
+      return res.status(200).json({
+        success: false,
+        neverLoggedAsB2C: true,
+        message: "Driver has never completed a B2C login",
+      });
+    }
+
+    // Also attempt Wise login in parallel to mirror loginCommonForDriver logic
+    const wiseResult = await loginDriverForWiseService(
+      normalizedVehicle,
+      gcm,
+    ).catch(() => ({ success: false, existInWise: false }));
+
+    const existInWise = wiseResult?.existInWise || false;
+    const wiseOtp = wiseResult?.wiseData?.otp || null;
+    const wiseCode = wiseResult?.wiseData?.code || null;
+    const wiseFlowActive = existInWise && wiseCode === 1 && !!wiseOtp;
+
+    const activeOtp = wiseFlowActive ? wiseOtp : loginResult.generatedOtp;
+    const activeSource = wiseFlowActive ? "wise" : "mmt";
+
+    const now = new Date();
+    const otpExpiry = new Date(now.getTime() + 5 * 60_000);
+
+    // ── STEP 5: Upsert auth record with fresh OTP ────────────────────────────
+    let record = await AuthModelForCommonDApp.findOne({
+      vehicleNumber: normalizedVehicle,
+    }).sort({ createdAt: -1 });
+
+    if (!record) {
+      record = new AuthModelForCommonDApp({
+        vehicleNumber: normalizedVehicle,
+        driverContact: loginResult.driverContact,
+        uniqueId: `${normalizedVehicle}_${loginResult.driverContact}`,
+        driver: {
+          contact: loginResult.driverContact,
+          name: loginResult.driverName,
+          driverId: loginResult.driverId,
+        },
+        b2c: {
+          exist: true,
+          verified: false,
+          otp: loginResult.generatedOtp,
+          token: "",
+          isNewRegister: false,
+        },
+        b2b: {
+          exist: existInWise,
+          verified: false,
+          otp: wiseOtp || null,
+          token: "",
+          isNewRegister: false,
+        },
+        wiseGcm: gcm,
+        otpTracking: {
+          code: activeOtp,
+          generatedAt: now,
+          expiresAt: otpExpiry,
+          source: activeSource,
+          attempts: 0,
+        },
+      });
+    } else {
+      record.b2c.exist = true;
+      record.b2c.otp = loginResult.generatedOtp;
+      record.b2c.verified = false;
+      record.b2b.exist = existInWise;
+      if (existInWise) record.b2b.otp = wiseOtp;
+      record.otpTracking = {
+        code: activeOtp,
+        generatedAt: now,
+        expiresAt: otpExpiry,
+        source: activeSource,
+        attempts: 0,
+      };
+    }
+
+    await record.save();
+
+    // ── STEP 6: Auto-verify the OTP internally ───────────────────────────────
+    // Simulate what validateOtp does — call verifyWiseOtp if wise flow,
+    // otherwise issue an MMT token directly.
+    let verificationResult;
+
+    if (wiseFlowActive) {
+      verificationResult = await verifyWiseOtp(
+        normalizedVehicle,
+        activeOtp,
+        gcm,
+      );
+    } else {
+      verificationResult = {
+        success: true,
+        source: "mmt",
+        token: `mmt_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`,
+        message: "Auto login OTP verified",
+      };
+    }
+
+    if (!verificationResult.success) {
+      return res.status(400).json({
+        success: false,
+        message: verificationResult.message || "Auto OTP verification failed",
+      });
+    }
+
+    // ── STEP 7: Persist verified session ────────────────────────────────────
+    const sessionToken = verificationResult.token;
+
+    if (verificationResult.source === "mmt") {
+      record.b2c.verified = true;
+      record.b2c.token = sessionToken;
+    } else {
+      record.b2b.verified = true;
+      record.b2b.token = sessionToken;
+
+      const wd = verificationResult.wiseDetails || {};
+      if (wd.mobileNo) record.driverContact = Number(wd.mobileNo);
+      if (wd.wiseToken) record.wiseToken = wd.wiseToken;
+      if (wd.cabId) record.wiseCabId = wd.cabId;
+      if (wd.allocationId) record.wiseAllocationId = wd.allocationId;
+      if (wd.carType) record.wiseCarType = wd.carType;
+      if (wd.isOnDuty !== undefined) record.wiseIsOnDuty = wd.isOnDuty;
+      if (wd.vendorId) record.wiseVendorId = wd.vendorId;
+      if (wd.branchId) record.wiseBranchId = wd.branchId;
+
+      // Dual-flow: also open B2C session
+      if (existInWise) {
+        record.b2c.verified = true;
+        record.b2c.token = `mmt_${Date.now()}_${Math.random()
+          .toString(36)
+          .substring(2, 15)}`;
+      }
+    }
+
+    record.otpTracking.code = null;
+    record.activeSession = {
+      token: sessionToken,
+      loginTime: now,
+      source: verificationResult.source,
+    };
+    record.lastLoginAt = now;
+
+    await record.save();
+
+    await DriverLoginHistory.create({
+      vehicleNumber: normalizedVehicle,
+      authRecordId: record._id,
+      action: "auto_login_success",
+      source: verificationResult.source,
+      details: {
+        autoLogin: true,
+        token: sessionToken,
+        driverContact: record.driverContact,
+      },
+    });
+
+    // ── STEP 8: Return same shape as validateOtp ─────────────────────────────
+    const wd = verificationResult.wiseDetails || {};
+
+    const finalResponse = {
+      success: true,
+      Code: 1,
+      Msg: "Auto B2B login successful",
+      source: verificationResult.source,
+      MobileNo: wd.mobileNo || record.driverContact || null,
+      Token: verificationResult.source === "wise" ? sessionToken : null,
+      AllocationID: wd.allocationId ?? null,
+      CabID: wd.cabId ?? null,
+      CabNo: wd.cabNo || null,
+      CarType: wd.carType || null,
+      OTP: null,
+      IsOnDuty: wd.isOnDuty ?? null,
+      VendorID: wd.vendorId ?? null,
+      BranchID: wd.branchId ?? null,
+    };
+
+    if (verificationResult.source === "mmt") {
+      finalResponse.b2cToken = sessionToken;
+    } else if (record.b2c?.token) {
+      finalResponse.b2cToken = record.b2c.token;
+    }
+
+    return res.status(200).json(finalResponse);
+  } catch (error) {
+    console.error("autoLoginToB2BIfExistInMMT Error:", error.message);
+    return res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+};
+
 module.exports = {
   loginCommonForDriver,
   checkWhenToSwitchToB2BApp,
   createOrUpdateConfig,
+
+  getCommanAuthDetailOnEveryHit,
+  autoLoginToB2BIfExistInMMT
 };
