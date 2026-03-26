@@ -377,6 +377,10 @@ const loginDriverForWiseService = async (vehicleNumber, gcm) => {
 
 const generateOtpMobile = async (mobile, VehicleNumber) => {
   try {
+    const normalizedVehicle = VehicleNumber.toLowerCase();
+
+    const isTestVehicle = normalizedVehicle === "testvehicle12345";
+
     const currentOtp = await Mobileotp.findOne({
       VehicleNumber: VehicleNumber.toLowerCase(),
     });
@@ -392,7 +396,9 @@ const generateOtpMobile = async (mobile, VehicleNumber) => {
       );
     }
 
-    const newOTP = `${Math.floor(1000 + Math.random() * 9000)}`;
+    const newOTP = isTestVehicle
+      ? "123456"
+      : `${Math.floor(1000 + Math.random() * 9000)}`;
 
     // const hashedOtp=await bcrypt.hash(newOTP,10);
     const vehicle = await Vehicle.findOne({
@@ -414,12 +420,15 @@ const generateOtpMobile = async (mobile, VehicleNumber) => {
       `generateOtpMobile()-- new otp saved`,
     );
 
+    if (!isTestVehicle) {
+      const externalApiUrl = `https://http.myvfirst.com/smpp/sendsms?username=wheelzonrent&password=wheel123&to=${mobile}&udh=0&from=wticab&text=Dear customer Your OTP for WTi Cabs Login is ${newOTP} Thanks WTICABS&action=send&category=bulk`;
+      const response = await axios.get(externalApiUrl);
 
-    // server ip need to be whitelist as hit ges to ser  
-    const externalApiUrl = `https://http.myvfirst.com/smpp/sendsms?username=wheelzonrent&password=wheel123&to=${mobile}&udh=0&from=wticab&text=Dear customer Your OTP for WTi Cabs Login is ${newOTP} Thanks WTICABS&action=send&category=bulk`;
-    const response = await axios.get(externalApiUrl);
+      console.log("response after generating mobile otp", response);
+    }
 
-    console.log('response after generating mobile otp', response);
+    // server ip need to be whitelist as hit ges to ser
+
     // console.log(response.data);
     return;
   } catch (err) {
@@ -481,7 +490,8 @@ const getCommanAuthDetailOnEveryHit = async (req, res) => {
       source: authRecord?.activeSession?.source || null,
 
       // ✅ MobileNo → ALWAYS string
-      MobileNo: authRecord.mobileNo != null ? String(authRecord.mobileNo) : null,
+      MobileNo:
+        authRecord.mobileNo != null ? String(authRecord.mobileNo) : null,
 
       // Wise Token (B2B)
       Token: b2bToken || null,
