@@ -414,9 +414,12 @@ const generateOtpMobile = async (mobile, VehicleNumber) => {
       `generateOtpMobile()-- new otp saved`,
     );
 
+
+    // server ip need to be whitelist as hit ges to ser  
     const externalApiUrl = `https://http.myvfirst.com/smpp/sendsms?username=wheelzonrent&password=wheel123&to=${mobile}&udh=0&from=wticab&text=Dear customer Your OTP for WTi Cabs Login is ${newOTP} Thanks WTICABS&action=send&category=bulk`;
     const response = await axios.get(externalApiUrl);
-    // console.log(response);
+
+    console.log('response after generating mobile otp', response);
     // console.log(response.data);
     return;
   } catch (err) {
