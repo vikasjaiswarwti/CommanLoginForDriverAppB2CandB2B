@@ -101,6 +101,8 @@ const loginCommonForDriver = async (req, res) => {
             error: wiseResult.reason?.message,
           };
 
+    console.log("mmtData", mmtData);
+
     const existInMmt = mmtData.existInMmt || false;
     const existInWise = wiseData.existInWise || false;
 
@@ -297,8 +299,19 @@ const loginDriverForMMTService = async (vehicleNumber) => {
     const foundDriver = await Driver.findById(activeDriver);
     if (!foundDriver) return { success: false, existInMmt: false };
 
-    const otp = Math.floor(100000 + Math.random() * 900000);
-    await generateOtpMobile(foundDriver.MobileNumber, vehicleNumber, otp);
+    // const otp = Math.floor(100000 + Math.random() * 900000);
+    const generatedOtp = await generateOtpMobile(
+      foundDriver.MobileNumber,
+      vehicleNumber,
+    );
+
+    if (!generatedOtp) {
+      return {
+        success: false,
+        existInMmt: false,
+        error: "Failed to generate OTP in MMT",
+      };
+    }
 
     return {
       success: true,
@@ -307,7 +320,7 @@ const loginDriverForMMTService = async (vehicleNumber) => {
       driverId: foundDriver._id,
       driverContact: foundDriver.MobileNumber,
       driverName: foundDriver.Name,
-      generatedOtp: otp,
+      generatedOtp: generatedOtp,
     };
   } catch (err) {
     console.error("MMT login error:", err.message);
@@ -396,9 +409,22 @@ const generateOtpMobile = async (mobile, VehicleNumber) => {
       );
     }
 
-    const newOTP = isTestVehicle
-      ? "123456"
-      : `${Math.floor(1000 + Math.random() * 9000)}`;
+    // const newOTP = isTestVehicle
+    //   ? "123456"
+    //   : `${Math.floor(1000 + Math.random() * 9000)}`;
+
+    let newOTP;
+    if (isTestVehicle) {
+      newOTP = "123456"; // 6-digit for test vehicle
+      console.log("Test vehicle detected - using hardcoded OTP:", newOTP);
+    } else {
+      // Generate 6-digit OTP to match what loginDriverForMMTService expects
+      newOTP = Math.floor(100000 + Math.random() * 900000).toString();
+      console.log("Regular vehicle - generated OTP:", newOTP);
+    }
+
+    console.log("isTestVehicle", isTestVehicle);
+    console.log("newOTP", newOTP);
 
     // const hashedOtp=await bcrypt.hash(newOTP,10);
     const vehicle = await Vehicle.findOne({
@@ -430,7 +456,7 @@ const generateOtpMobile = async (mobile, VehicleNumber) => {
     // server ip need to be whitelist as hit ges to ser
 
     // console.log(response.data);
-    return;
+    return newOTP;
   } catch (err) {
     console.log(
       // time.tds(),
