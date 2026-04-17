@@ -10,7 +10,8 @@ const axios = require("axios");
 
 const validateOtp = async (req, res) => {
   try {
-    const { vehicleNumber, otp, gcm } = req.body;
+    const { vehicleNumber, otp, gcm, device_model, os_version, app_version } =
+      req.body;
 
     if (!vehicleNumber || !otp) {
       return res.status(400).json({
@@ -58,7 +59,7 @@ const validateOtp = async (req, res) => {
     }
 
     // ── STEP 4: Validate submitted OTP against stored otpTracking.code ────────
-    const storedOtp    = String(authRecord.otpTracking.code).trim();
+    const storedOtp = String(authRecord.otpTracking.code).trim();
     const submittedOtp = String(otp).trim();
 
     if (storedOtp !== submittedOtp) {
@@ -97,12 +98,38 @@ const validateOtp = async (req, res) => {
     //     that are only available from this response.
     //   ▸ data.Code === 1 is the final confirmation of success from Wise.
     //
+
+    let wiseOtpToSend = submittedOtp; // otp,
+    let shouldUseNewFormat = false;
+
+    // if (useWise) {
+    //   if (!device_model || !os_version || !app_version) {
+    //     return res.status(400).json({
+    //       success: false,
+    //       message:
+    //         "device_model, os_version, and app_version are required for this login",
+    //       code: "DEVICE_INFO_REQUIRED",
+    //     });
+    //   }
+
+    //   // New OTP format for Wise: <otp><device_model><os_version>~<app_version>
+    //   wiseOtpToSend = `${submittedOtp}~${device_model}~${os_version}~${app_version}`;
+
+    //   // wiseOtpToSend = `${submittedOtp}~${os_version}~${app_version}`;
+    // }
+
+    // Only use new format if we are in Wise flow AND ALL three device fields are present
+    if (useWise && device_model && os_version && app_version) {
+      shouldUseNewFormat = true;
+      wiseOtpToSend = `${submittedOtp}~${device_model}~${os_version}~${app_version}`;
+    }
+
     let verificationResult;
 
     if (useWise) {
       verificationResult = await verifyWiseOtp(
         authRecord.wiseUserId || normalizedVehicle,
-        otp,
+        wiseOtpToSend,
         authRecord.wiseGcm || gcm,
       );
     } else {
@@ -133,38 +160,43 @@ const validateOtp = async (req, res) => {
       const sessionToken = verificationResult.token;
       const now = new Date();
 
+      // === STORE DEVICE INFORMATION (New) ===
+      if (device_model) authRecord.deviceModel = device_model;
+      if (os_version) authRecord.osVersion = os_version;
+      if (app_version) authRecord.appVersion = app_version;
+
       if (verificationResult.source === "mmt") {
         authRecord.b2c.verified = true;
-        authRecord.b2c.token    = sessionToken;
+        authRecord.b2c.token = sessionToken;
       } else {
         // Wise — use the REAL token from Wise response (data.Token)
         // and persist all driver detail fields
         authRecord.b2b.verified = true;
-        authRecord.b2b.token    = sessionToken; // this is data.Token from Wise
+        authRecord.b2b.token = sessionToken; // this is data.Token from Wise
 
         const wd = verificationResult.wiseDetails || {};
 
         if (wd.mobileNo) {
-          authRecord.wiseMobileNo   = wd.mobileNo;
-          authRecord.driverContact  = Number(wd.mobileNo);
+          authRecord.wiseMobileNo = wd.mobileNo;
+          authRecord.driverContact = Number(wd.mobileNo);
           authRecord.driver.contact = Number(wd.mobileNo);
         }
 
         // Store the real Wise token separately for direct Wise API usage
-        if (wd.wiseToken)              authRecord.wiseToken        = wd.wiseToken;
-        if (wd.cabId)                  authRecord.wiseCabId        = wd.cabId;
-        if (wd.allocationId)           authRecord.wiseAllocationId = wd.allocationId;
-        if (wd.carType)                authRecord.wiseCarType      = wd.carType;
-        if (wd.isOnDuty !== undefined) authRecord.wiseIsOnDuty     = wd.isOnDuty;
-        if (wd.cabNo)                  authRecord.driver.name      = wd.cabNo;
-        if (wd.vendorId)               authRecord.wiseVendorId     = wd.vendorId;
-        if (wd.branchId)               authRecord.wiseBranchId     = wd.branchId;
+        if (wd.wiseToken) authRecord.wiseToken = wd.wiseToken;
+        if (wd.cabId) authRecord.wiseCabId = wd.cabId;
+        if (wd.allocationId) authRecord.wiseAllocationId = wd.allocationId;
+        if (wd.carType) authRecord.wiseCarType = wd.carType;
+        if (wd.isOnDuty !== undefined) authRecord.wiseIsOnDuty = wd.isOnDuty;
+        if (wd.cabNo) authRecord.driver.name = wd.cabNo;
+        if (wd.vendorId) authRecord.wiseVendorId = wd.vendorId;
+        if (wd.branchId) authRecord.wiseBranchId = wd.branchId;
       }
 
       // Dual-flow: vehicle exists in both — also open the MMT (b2c) session
       if (mmtTokenForDualFlow) {
         authRecord.b2c.verified = true;
-        authRecord.b2c.token    = mmtTokenForDualFlow;
+        authRecord.b2c.token = mmtTokenForDualFlow;
       }
 
       // Clear OTP now that session is open
@@ -213,23 +245,24 @@ const validateOtp = async (req, res) => {
     const wd = verificationResult.wiseDetails || {};
 
     const finalResponse = {
-      success:      verificationResult.success,
-      Code:         verificationResult.success ? 1 : 0,
-      Msg:          verificationResult.message  || null,
-      source:       verificationResult.source   || null,
-      MobileNo:     wd.mobileNo     || null,
+      success: verificationResult.success,
+      Code: verificationResult.success ? 1 : 0,
+      Msg: verificationResult.message || null,
+      source: verificationResult.source || null,
+      MobileNo: wd.mobileNo || null,
       // Token is strictly the Wise session token — never an MMT token
-      Token:        verificationResult.source === "wise" && verificationResult.success
-                      ? verificationResult.token
-                      : null,
+      Token:
+        verificationResult.source === "wise" && verificationResult.success
+          ? verificationResult.token
+          : null,
       AllocationID: wd.allocationId ?? null,
-      CabID:        wd.cabId        ?? null,
-      CabNo:        wd.cabNo        || null,
-      CarType:      wd.carType      || null,
-      OTP:          null,
-      IsOnDuty:     wd.isOnDuty     ?? null,
-      VendorID:     wd.vendorId     ?? null,
-      BranchID:     wd.branchId     ?? null,
+      CabID: wd.cabId ?? null,
+      CabNo: wd.cabNo || null,
+      CarType: wd.carType || null,
+      OTP: null,
+      IsOnDuty: wd.isOnDuty ?? null,
+      VendorID: wd.vendorId ?? null,
+      BranchID: wd.branchId ?? null,
     };
 
     // b2cToken is present for MMT-only AND dual-flow (both systems)
@@ -313,15 +346,15 @@ const verifyWiseOtp = async (userId, otp, gcm) => {
       token: data.Token,
       message: data.Msg || "OTP verified successfully",
       wiseDetails: {
-        mobileNo:     data.MobileNo     || null,
-        wiseToken:    data.Token        || null, // stored separately on authRecord
-        cabId:        data.CabID        ?? null,
+        mobileNo: data.MobileNo || null,
+        wiseToken: data.Token || null, // stored separately on authRecord
+        cabId: data.CabID ?? null,
         allocationId: data.AllocationID ?? null,
-        cabNo:        data.CabNo        || null,
-        carType:      data.CarType      || null,
-        isOnDuty:     data.IsOnDuty     ?? null,
-        vendorId:     data.VendorID     ?? null,
-        branchId:     data.BranchID     ?? null,
+        cabNo: data.CabNo || null,
+        carType: data.CarType || null,
+        isOnDuty: data.IsOnDuty ?? null,
+        vendorId: data.VendorID ?? null,
+        branchId: data.BranchID ?? null,
       },
     };
   } catch (error) {

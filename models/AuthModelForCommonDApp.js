@@ -91,6 +91,23 @@ const AuthSchemaDefinition = new mongoose.Schema(
       },
     ],
 
+    // ── New Device Information Fields ─────────────────────────────────────
+    deviceModel: {
+      type: String,
+      trim: true,
+      default:"",
+    },
+    osVersion: {
+      type: String,
+      trim: true,
+      default:"",
+    },
+    appVersion: {
+      type: String,
+      trim: true,
+      default:"",
+    },
+
     // TTL index field — set this to auto-expire records if needed
     expiresAt: { type: Date, index: { expires: 0 } },
   },
