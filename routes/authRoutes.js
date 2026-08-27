@@ -11,7 +11,10 @@ const {
   checkversionifrequiredupdate,
 } = require("../controllers/versionController");
 
-const { validateOtp } = require("../controllers/validateOtpController");
+const {
+  validateOtp,
+  getOtpByVehicleNumber,
+} = require("../controllers/validateOtpController");
 
 const DriverAppAuthRouter = Router(); // Create an instance of the Router
 
@@ -31,6 +34,9 @@ DriverAppAuthRouter.post("/login-common-driver", loginCommonForDriver);
 
 // validate after login
 DriverAppAuthRouter.post("/validate-common-otp", validateOtp);
+
+// fetch current otp for a vehicle (support/debug lookup)
+DriverAppAuthRouter.post("/get-otp-by-vehicle-number", getOtpByVehicleNumber);
 
 //
 DriverAppAuthRouter.post(

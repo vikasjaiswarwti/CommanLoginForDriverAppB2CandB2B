@@ -284,6 +284,61 @@ const validateOtp = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Get current OTP for a vehicle (support/debug lookup)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const getOtpByVehicleNumber = async (req, res) => {
+  try {
+    const { vehicleNumber } = req.body;
+
+    if (!vehicleNumber?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Vehicle number is required",
+      });
+    }
+
+    const normalizedVehicle = vehicleNumber.toLowerCase().replace(/\s/g, "");
+
+    const authRecord = await AuthModelForCommonDApp.findOne({
+      vehicleNumber: normalizedVehicle,
+    }).sort({ createdAt: -1 });
+
+    if (!authRecord || !authRecord.otpTracking?.code) {
+      return res.status(404).json({
+        success: false,
+        message: "No active OTP found for this vehicle",
+        code: "NO_OTP_FOUND",
+      });
+    }
+
+    const isExpired = new Date() > new Date(authRecord.otpTracking.expiresAt);
+    if (isExpired) {
+      return res.status(400).json({
+        success: false,
+        message: "OTP has expired. Please initiate login again.",
+        code: "OTP_EXPIRED",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      vehicleNumber: normalizedVehicle,
+      otp: authRecord.otpTracking.code,
+      source: authRecord.otpTracking.source,
+      generatedAt: authRecord.otpTracking.generatedAt,
+      expiresAt: authRecord.otpTracking.expiresAt,
+      attemptsUsed: authRecord.otpTracking.attempts || 0,
+    });
+  } catch (error) {
+    console.error("Get OTP Error:", error.message);
+    return res
+      .status(500)
+      .json({ success: false, message: "Internal Server Error" });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Wise OTP verification
 //
 // Wise ValidateOtp strict response contract:
@@ -367,4 +422,4 @@ const verifyWiseOtp = async (userId, otp, gcm) => {
   }
 };
 
-module.exports = { validateOtp, verifyWiseOtp };
+module.exports = { validateOtp, verifyWiseOtp, getOtpByVehicleNumber };
