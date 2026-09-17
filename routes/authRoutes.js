@@ -16,6 +16,11 @@ const {
   getOtpByVehicleNumber,
 } = require("../controllers/validateOtpController");
 
+const {
+  getPermissionConfig,
+  createOrUpdatePermissionConfig,
+} = require("../controllers/permissionConfigController");
+
 const DriverAppAuthRouter = Router(); // Create an instance of the Router
 
 // login
@@ -49,6 +54,15 @@ DriverAppAuthRouter.post(
 DriverAppAuthRouter.post(
   "/check-version-if-require-dupdate",
   checkversionifrequiredupdate,
+);
+
+// permission config routes ----
+
+DriverAppAuthRouter.get("/get-permission-config", getPermissionConfig);
+
+DriverAppAuthRouter.post(
+  "/create-or-update/permission-config",
+  createOrUpdatePermissionConfig,
 );
 
 module.exports = DriverAppAuthRouter; // Export the router instance directly
