@@ -75,36 +75,68 @@ const loginCommonForDriver = async (req, res) => {
 
     const normalizedVehicle = vehicleNumber.toLowerCase().replace(/\s/g, "");
 
-    // Call both services in parallel — neither failure blocks the other
-    const [mmtResult, wiseResult] = await Promise.allSettled([
-      loginDriverForMMTService(normalizedVehicle),
-      loginDriverForWiseService(normalizedVehicle, gcm),
-    ]);
+    // ── STEP 1: Resolve Wise FIRST ────────────────────────────────────────────
+    // Wise's ValidateUser call dispatches an OTP as a side effect of merely
+    // checking existence, so we must know its outcome before deciding whether
+    // MMT should generate/send a second, competing OTP.
+    console.log(
+      `[OTP-SERVICE] loginCommonForDriver: calling WISE OTP service (ValidateUser) for vehicle=${normalizedVehicle}`,
+    );
+    const wiseResult = await loginDriverForWiseService(
+      normalizedVehicle,
+      gcm,
+    ).catch((err) => ({ __rejected: true, err }));
 
-    // Unwrap settled results
-    const mmtData =
-      mmtResult.status === "fulfilled"
-        ? mmtResult.value
-        : {
-            success: false,
-            existInMmt: false,
-            error: mmtResult.reason?.message,
-          };
+    const wiseData = wiseResult?.__rejected
+      ? {
+          success: false,
+          existInWise: false,
+          timeout: wiseResult.err?.code === "ECONNABORTED",
+          error: wiseResult.err?.message,
+        }
+      : wiseResult;
 
-    const wiseData =
-      wiseResult.status === "fulfilled"
-        ? wiseResult.value
-        : {
-            success: false,
-            existInWise: false,
-            timeout: wiseResult.reason?.code === "ECONNABORTED",
-            error: wiseResult.reason?.message,
-          };
+    const existInWise = wiseData.existInWise || false;
+
+    // ── OTP source decision — purely data driven ─────────────────────────────
+    //
+    // Wise flow is active ONLY when Wise returned code:1 AND an otp value.
+    const wiseOtp = wiseData.wiseData?.otp || null;
+    const wiseCode = wiseData.wiseData?.code || null;
+
+    const wiseFlowActive = existInWise && wiseCode === 1 && !!wiseOtp;
+
+    console.log(
+      `[OTP-SERVICE] WISE OTP service result: existInWise=${existInWise}, wiseCode=${wiseCode}, otpReceived=${!!wiseOtp}, wiseFlowActive=${wiseFlowActive}`,
+    );
+
+    // ── STEP 2: Only now call MMT, telling it whether to send its own OTP ────
+    // If the vehicle exists in Wise at all, MMT is looked up for identity
+    // fields only — no SMS. MMT OTP is generated ONLY when the vehicle does
+    // NOT exist in Wise (i.e. MMT-only). Using existInWise here (rather than
+    // wiseFlowActive) means the MMT OTP stays skipped even in the edge case
+    // where Wise returns code:1 without an otp value.
+    // We await this fully before moving on, so we always know for certain
+    // whether the MMT OTP was actually sent before building the response.
+    console.log(
+      `[OTP-SERVICE] loginCommonForDriver: calling MMT OTP service for vehicle=${normalizedVehicle}, sendOtp=${!existInWise}`,
+    );
+    const mmtResult = await loginDriverForMMTService(
+      normalizedVehicle,
+      !existInWise,
+    ).catch((err) => ({ __rejected: true, err }));
+
+    const mmtData = mmtResult?.__rejected
+      ? {
+          success: false,
+          existInMmt: false,
+          error: mmtResult.err?.message,
+        }
+      : mmtResult;
 
     console.log("mmtData", mmtData);
 
     const existInMmt = mmtData.existInMmt || false;
-    const existInWise = wiseData.existInWise || false;
 
     // ── Not found in any system ──────────────────────────────────────────────
     if (!existInMmt && !existInWise) {
@@ -116,21 +148,12 @@ const loginCommonForDriver = async (req, res) => {
       });
     }
 
-    // ── OTP source decision — purely data driven ─────────────────────────────
-    //
-    // Wise flow is active ONLY when Wise returned code:1 AND an otp value.
-    // This single condition covers all three cases:
-    //   existInMmt && existInWise  → Wise OTP overrides MMT OTP
-    //   existInMmt only            → MMT OTP (Wise never returned code:1 + otp)
-    //   existInWise only           → Wise OTP
-    //
-    const wiseOtp = wiseData.wiseData?.otp || null;
-    const wiseCode = wiseData.wiseData?.code || null;
-
-    const wiseFlowActive = existInWise && wiseCode === 1 && !!wiseOtp;
-
     const activeOtp = wiseFlowActive ? wiseOtp : mmtData.generatedOtp || null;
     const activeSource = wiseFlowActive ? "wise" : "mmt";
+
+    console.log(
+      `[OTP-SERVICE] Active OTP source for vehicle=${normalizedVehicle}: ${activeSource.toUpperCase()}`,
+    );
 
     // ── Driver identity ──────────────────────────────────────────────────────
     const driverContact = existInMmt ? mmtData.driverContact : null;
@@ -253,8 +276,8 @@ const loginCommonForDriver = async (req, res) => {
       response.b2c = {
         exist: true,
         verified: false,
-        otpSent: true,
-        otpExpiry,
+        otpSent: !!mmtData.generatedOtp,
+        otpExpiry: mmtData.generatedOtp ? otpExpiry : null,
       };
     }
 
@@ -286,7 +309,7 @@ const loginCommonForDriver = async (req, res) => {
 // MMT service login
 // ─────────────────────────────────────────────
 
-const loginDriverForMMTService = async (vehicleNumber) => {
+const loginDriverForMMTService = async (vehicleNumber, sendOtp = true) => {
   try {
     const foundVehicle = await Vehicle.findOne({
       VehicleNumber: vehicleNumber,
@@ -299,6 +322,27 @@ const loginDriverForMMTService = async (vehicleNumber) => {
     const foundDriver = await Driver.findById(activeDriver);
     if (!foundDriver) return { success: false, existInMmt: false };
 
+    // Wise already won this login (or caller doesn't want an OTP) — return
+    // identity fields only, without generating/sending a second MMT OTP.
+    if (!sendOtp) {
+      console.log(
+        `[OTP-SERVICE] MMT OTP generation SKIPPED for vehicle=${vehicleNumber} (Wise OTP already active)`,
+      );
+      return {
+        success: true,
+        existInMmt: true,
+        vehicleId: foundVehicle._id,
+        driverId: foundDriver._id,
+        driverContact: foundDriver.MobileNumber,
+        driverName: foundDriver.Name,
+        generatedOtp: null,
+        otpSkipped: true,
+      };
+    }
+
+    console.log(
+      `[OTP-SERVICE] Invoking MMT OTP service (generateOtpMobile) for vehicle=${vehicleNumber}, mobile=${foundDriver.MobileNumber}`,
+    );
     // const otp = Math.floor(100000 + Math.random() * 900000);
     const generatedOtp = await generateOtpMobile(
       foundDriver.MobileNumber,
@@ -339,6 +383,10 @@ const loginDriverForWiseService = async (vehicleNumber, gcm) => {
   try {
     const wiseApiUrl = `${process.env.WISE_BASE_URL}/api/Login/ValidateUser`;
 
+    console.log(
+      `[OTP-SERVICE] WISE ValidateUser API called (dispatches OTP as side effect) for vehicle=${vehicleNumber}, url=${wiseApiUrl}`,
+    );
+
     const response = await axios.get(wiseApiUrl, {
       params: {
         UserID: vehicleNumber,
@@ -354,6 +402,10 @@ const loginDriverForWiseService = async (vehicleNumber, gcm) => {
     if (!response.data) return { success: false, existInWise: false };
 
     const exists = response.data.code === 1;
+
+    console.log(
+      `[OTP-SERVICE] WISE ValidateUser response for vehicle=${vehicleNumber}: code=${response.data.code}, otpPresent=${!!response.data.otp}, msg=${response.data.msg}`,
+    );
 
     return {
       success: true,
@@ -447,10 +499,17 @@ const generateOtpMobile = async (mobile, VehicleNumber) => {
     );
 
     if (!isTestVehicle) {
+      console.log(
+        `[OTP-SERVICE] MMT SMS gateway (myvfirst) called for mobile=${mobile}, vehicle=${VehicleNumber}`,
+      );
       const externalApiUrl = `https://http.myvfirst.com/smpp/sendsms?username=wheelzonrent&password=wheel123&to=${mobile}&udh=0&from=wticab&text=Dear customer Your OTP for WTi Cabs Login is ${newOTP} Thanks WTICABS&action=send&category=bulk`;
       const response = await axios.get(externalApiUrl);
 
       console.log("response after generating mobile otp", response);
+    } else {
+      console.log(
+        `[OTP-SERVICE] MMT SMS gateway SKIPPED for test vehicle=${VehicleNumber} (hardcoded OTP used)`,
+      );
     }
 
     // server ip need to be whitelist as hit ges to ser
@@ -599,6 +658,9 @@ const autoLoginToB2BIfExistInMMT = async (req, res) => {
     }
 
     // Also attempt Wise login in parallel to mirror loginCommonForDriver logic
+    console.log(
+      `[OTP-SERVICE] autoLoginToB2BIfExistInMMT: calling WISE OTP service (ValidateUser) for vehicle=${normalizedVehicle}`,
+    );
     const wiseResult = await loginDriverForWiseService(
       normalizedVehicle,
       gcm,
@@ -611,6 +673,10 @@ const autoLoginToB2BIfExistInMMT = async (req, res) => {
 
     const activeOtp = wiseFlowActive ? wiseOtp : loginResult.generatedOtp;
     const activeSource = wiseFlowActive ? "wise" : "mmt";
+
+    console.log(
+      `[OTP-SERVICE] autoLoginToB2BIfExistInMMT: active OTP source for vehicle=${normalizedVehicle}: ${activeSource.toUpperCase()}`,
+    );
 
     const now = new Date();
     const otpExpiry = new Date(now.getTime() + 5 * 60_000);
