@@ -5,6 +5,7 @@ const {
   createOrUpdateConfig,
   loginCommonForDriver,
   getCommanAuthDetailOnEveryHit,
+  logoutCommonForDriver,
 } = require("../controllers/loginController");
 
 const {
@@ -37,6 +38,9 @@ DriverAppAuthRouter.post(
 // login api
 DriverAppAuthRouter.post("/login-common-driver", loginCommonForDriver);
 
+// logout api
+DriverAppAuthRouter.post("/logout-common-driver", logoutCommonForDriver);
+
 // validate after login
 DriverAppAuthRouter.post("/validate-common-otp", validateOtp);
 
@@ -48,6 +52,8 @@ DriverAppAuthRouter.post(
   "/get-comman-auth-detail-on-every-hit",
   getCommanAuthDetailOnEveryHit,
 );
+
+
 
 // version route ----
 

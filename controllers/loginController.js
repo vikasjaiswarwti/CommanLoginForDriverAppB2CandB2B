@@ -850,6 +850,161 @@ const autoLoginToB2BIfExistInMMT = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────
+// Wise service logout
+//
+// Ends the driver's Wise (B2B) session. Unlike ValidateUser/ValidateOtp,
+// Logout is authenticated by the session token itself, not ApiID/ApiPassword.
+// ─────────────────────────────────────────────
+
+const logoutDriverFromWiseService = async (
+  wiseToken,
+  wiseUserId,
+  wiseAllocationId,
+) => {
+  try {
+    const wiseApiUrl = `${process.env.WISE_BASE_URL}/api/Chauffuer/Logout`;
+
+    console.log(
+      `[OTP-SERVICE] WISE Logout API called for userId=${wiseUserId}, allocationId=${wiseAllocationId}`,
+    );
+
+    const response = await axios.get(wiseApiUrl, {
+      params: {
+        token: wiseToken,
+        userid: wiseUserId,
+        AllocationID: wiseAllocationId,
+        Status: 0,
+      },
+      timeout: 5000,
+    });
+
+    console.log(
+      `[OTP-SERVICE] WISE Logout API response for userId=${wiseUserId}:`,
+      response.data,
+    );
+
+    return { success: true, data: response.data };
+  } catch (err) {
+    console.error("Wise logout error:", err.message);
+    return { success: false, error: err.message };
+  }
+};
+
+// ─────────────────────────────────────────────
+// Common logout entry point
+//
+// Mirrors loginCommonForDriver's decision-driven approach: the caller only
+// sends the vehicle number, and this figures out — purely from what's
+// actually active on the auth record — which system(s) to log out of.
+// A Wise session is closed via Wise's own Logout API; an MMT (B2C) session
+// has no external session to invalidate, so it's cleared locally only.
+// ─────────────────────────────────────────────
+
+const logoutCommonForDriver = async (req, res) => {
+  try {
+    const { vehicleNumber, wiseToken, wiseUserId, wiseAllocationId } =
+      req.body;
+
+    if (!vehicleNumber?.trim()) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Vehicle number is required" });
+    }
+
+    const normalizedVehicle = vehicleNumber.toLowerCase().replace(/\s/g, "");
+
+    const authRecord = await AuthModelForCommonDApp.findOne({
+      vehicleNumber: normalizedVehicle,
+    }).sort({ createdAt: -1 });
+
+    if (!authRecord) {
+      return res.status(404).json({
+        success: false,
+        message: "No auth record found for this vehicle",
+      });
+    }
+
+    const wasLoggedIntoWise = !!(
+      authRecord.b2b?.verified && authRecord.b2b?.token
+    );
+    const wasLoggedIntoMmt = !!(
+      authRecord.b2c?.verified && authRecord.b2c?.token
+    );
+
+    if (!wasLoggedIntoWise && !wasLoggedIntoMmt) {
+      return res.status(200).json({
+        success: true,
+        message: "No active session to log out",
+        loggedOutFrom: [],
+      });
+    }
+
+    const loggedOutFrom = [];
+    let wiseLogoutResult = null;
+
+    // ── Wise (B2B) logout — only when a Wise session is actually active ──────
+    // wiseToken/wiseUserId/wiseAllocationId can be passed in by the caller
+    // (e.g. the app's current in-memory session values); anything not
+    // passed falls back to what's stored on the auth record.
+    if (wasLoggedIntoWise) {
+      wiseLogoutResult = await logoutDriverFromWiseService(
+        wiseToken || authRecord.wiseToken,
+        wiseUserId || authRecord.wiseUserId || normalizedVehicle,
+        wiseAllocationId || authRecord.wiseAllocationId,
+      );
+
+      authRecord.b2b.verified = false;
+      authRecord.b2b.token = "";
+      loggedOutFrom.push("wise");
+    }
+
+    // ── MMT (B2C) logout — nothing external to call, clear locally ──────────
+    if (wasLoggedIntoMmt) {
+      authRecord.b2c.verified = false;
+      authRecord.b2c.token = "";
+      loggedOutFrom.push("mmt");
+    }
+
+    authRecord.activeSession = null;
+
+    await authRecord.save();
+
+    await DriverLoginHistory.create({
+      vehicleNumber: normalizedVehicle,
+      authRecordId: authRecord._id,
+      action: "logout",
+      source: loggedOutFrom.length === 2 ? "both" : loggedOutFrom[0],
+      details: {
+        loggedOutFrom,
+        wiseLogoutSuccess: wiseLogoutResult?.success ?? null,
+        wiseLogoutError:
+          wiseLogoutResult?.success === false ? wiseLogoutResult.error : null,
+      },
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Logout successful",
+      loggedOutFrom,
+      ...(wasLoggedIntoWise
+        ? {
+            wiseLogout: {
+              success: wiseLogoutResult.success,
+              data: wiseLogoutResult.data || null,
+              error: wiseLogoutResult.error || null,
+            },
+          }
+        : {}),
+    });
+  } catch (err) {
+    console.error("Common Logout Error:", err.message);
+    return res
+      .status(500)
+      .json({ success: false, message: "Internal Server Error" });
+  }
+};
+
 module.exports = {
   loginCommonForDriver,
   checkWhenToSwitchToB2BApp,
@@ -857,4 +1012,5 @@ module.exports = {
 
   getCommanAuthDetailOnEveryHit,
   autoLoginToB2BIfExistInMMT,
+  logoutCommonForDriver,
 };

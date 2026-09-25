@@ -29,6 +29,7 @@ const DriverLoginHistorySchema = new mongoose.Schema(
     //   login_success    → OTP verified, session opened
     //   otp_failed       → wrong OTP submitted
     //   wise_verify_failed → OTP matched locally but Wise API returned failure
+    //   logout           → common logout API called, session(s) closed
     action: {
       type: String,
       enum: [
@@ -36,6 +37,7 @@ const DriverLoginHistorySchema = new mongoose.Schema(
         "login_success",
         "otp_failed",
         "wise_verify_failed",
+        "logout",
       ],
       required: true,
     },

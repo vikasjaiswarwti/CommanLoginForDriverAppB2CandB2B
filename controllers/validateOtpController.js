@@ -12,6 +12,8 @@ const validateOtp = async (req, res) => {
   try {
     const { vehicleNumber, otp, gcm, device_model, os_version, app_version } =
       req.body;
+    const device_brand = req.body.device_brand ?? req.body.deviceBrand;
+    const miscellaneous = req.body.miscellaneous ?? req.body.miscellenious;
 
     if (!vehicleNumber || !otp) {
       return res.status(400).json({
@@ -164,6 +166,15 @@ const validateOtp = async (req, res) => {
       if (device_model) authRecord.deviceModel = device_model;
       if (os_version) authRecord.osVersion = os_version;
       if (app_version) authRecord.appVersion = app_version;
+      if (device_brand) authRecord.deviceBrand = String(device_brand);
+      if (
+        miscellaneous &&
+        typeof miscellaneous === "object" &&
+        !Array.isArray(miscellaneous)
+      ) {
+        authRecord.miscellaneous = miscellaneous;
+        authRecord.markModified("miscellaneous");
+      }
 
       if (verificationResult.source === "mmt") {
         authRecord.b2c.verified = true;

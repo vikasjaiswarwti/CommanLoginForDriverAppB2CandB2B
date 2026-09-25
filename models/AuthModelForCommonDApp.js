@@ -107,6 +107,16 @@ const AuthSchemaDefinition = new mongoose.Schema(
       trim: true,
       default:"",
     },
+    deviceBrand: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    // Free-form extra info sent by the app during OTP validation
+    miscellaneous: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
 
     // TTL index field — set this to auto-expire records if needed
     expiresAt: { type: Date, index: { expires: 0 } },
