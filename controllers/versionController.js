@@ -8,7 +8,7 @@ const checkversionifrequiredupdate = async (req, res) => {
         .json({ required: false, message: "Version is required" });
     }
 
-    const isUpToDate = isVersionUpToDate(version, "1.0.7");
+    const isUpToDate = isVersionUpToDate(version, "1.0.13");
 
     if (isUpToDate) {
       return res
