@@ -24,6 +24,7 @@ const getPermissionConfig = async (req, res) => {
         Background: config.background,
         Phone: config.phone,
         picturesAndRecordVideo: config.picturesAndRecordVideo,
+        latestAppVersion: config.latestAppVersion,
       },
     });
   } catch (error) {
@@ -44,9 +45,22 @@ const createOrUpdatePermissionConfig = async (req, res) => {
       background,
       phone,
       picturesAndRecordVideo,
+      latestAppVersion,
     } = req.body;
 
+    if (
+      latestAppVersion !== undefined &&
+      !/^\d+(\.\d+)*$/.test(String(latestAppVersion).trim())
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'latestAppVersion must look like "1.0.14"',
+      });
+    }
+
     const update = {};
+    if (latestAppVersion !== undefined)
+      update.latestAppVersion = String(latestAppVersion).trim();
     if (typeof battery === "boolean") update.battery = battery;
     if (typeof overlay === "boolean") update.overlay = overlay;
     if (typeof notification === "boolean") update.notification = notification;

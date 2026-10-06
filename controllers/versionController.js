@@ -1,3 +1,5 @@
+const PermissionConfig = require("../models/PermissionConfig");
+
 const checkversionifrequiredupdate = async (req, res) => {
   try {
     const { version } = req.body;
@@ -8,7 +10,18 @@ const checkversionifrequiredupdate = async (req, res) => {
         .json({ required: false, message: "Version is required" });
     }
 
-    const isUpToDate = isVersionUpToDate(version, "1.0.12");
+    // Minimum version lives on GLOBAL_PERMISSION_CONFIG_DRIVER_APP — change it
+    // via /create-or-update/permission-config { latestAppVersion: "x.y.z" }
+    const config = await PermissionConfig.findOneAndUpdate(
+      { _id: "GLOBAL_PERMISSION_CONFIG_DRIVER_APP" },
+      {},
+      { new: true, upsert: true, setDefaultsOnInsert: true },
+    );
+
+    const isUpToDate = isVersionUpToDate(
+      String(version),
+      config.latestAppVersion,
+    );
 
     if (isUpToDate) {
       return res
@@ -20,6 +33,7 @@ const checkversionifrequiredupdate = async (req, res) => {
         .json({ required: true, message: "Update required" });
     }
   } catch (err) {
+    console.error("Version Check Error:", err.message);
     return res
       .status(500)
       .json({ required: false, message: "Internal server error" });

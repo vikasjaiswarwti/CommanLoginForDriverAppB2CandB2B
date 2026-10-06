@@ -34,6 +34,14 @@ const PermissionConfigSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    // Minimum app version; anything lower gets "Update required" from
+    // /check-version-if-require-dupdate. Format: "major.minor.patch"
+    latestAppVersion: {
+      type: String,
+      default: "1.0.14",
+      trim: true,
+      match: /^\d+(\.\d+)*$/,
+    },
   },
   { timestamps: true },
 );

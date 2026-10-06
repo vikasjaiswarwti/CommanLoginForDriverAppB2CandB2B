@@ -1,7 +1,11 @@
 // controllers/CommonDriverApp/validateOtpController.js
 
 const AuthModelForCommonDApp = require("../models/AuthModelForCommonDApp");
-const DriverLoginHistory = require("../models/DriverLoginHistory");
+const {
+  recordExternalCall,
+  logLoginEvent,
+  normalizeVehicle,
+} = require("../utils/loginHistoryLogger");
 const axios = require("axios");
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -9,6 +13,7 @@ const axios = require("axios");
 // ─────────────────────────────────────────────────────────────────────────────
 
 const validateOtp = async (req, res) => {
+  let authRecordId = null;
   try {
     const { vehicleNumber, otp, gcm, device_model, os_version, app_version } =
       req.body;
@@ -30,12 +35,22 @@ const validateOtp = async (req, res) => {
     }).sort({ createdAt: -1 });
 
     if (!authRecord) {
+      await logLoginEvent(req, {
+        vehicleNumber: normalizedVehicle,
+        action: "otp_failed",
+        status: "failure",
+        source: "none",
+        httpStatus: 404,
+        errorCode: "NO_SESSION_FOUND",
+        message: "No login initiated for this vehicle",
+      });
       return res.status(404).json({
         success: false,
         message: "No login initiated for this vehicle. Please login first.",
         code: "NO_SESSION_FOUND",
       });
     }
+    authRecordId = authRecord._id;
 
     // ── STEP 2: Decide OTP flow from what was stored at login time ────────────
     // "wise" → Wise returned code:1 + otp during login → must call Wise API
@@ -44,6 +59,16 @@ const validateOtp = async (req, res) => {
 
     // ── STEP 3: Basic guards ─────────────────────────────────────────────────
     if (!authRecord.otpTracking || !authRecord.otpTracking.code) {
+      await logLoginEvent(req, {
+        vehicleNumber: normalizedVehicle,
+        authRecordId,
+        action: "otp_failed",
+        status: "failure",
+        source: authRecord.otpTracking?.source,
+        httpStatus: 400,
+        errorCode: "NO_OTP_FOUND",
+        message: "No active OTP found",
+      });
       return res.status(400).json({
         success: false,
         message: "No active OTP found. Please initiate login again.",
@@ -53,6 +78,17 @@ const validateOtp = async (req, res) => {
 
     const isExpired = new Date() > new Date(authRecord.otpTracking.expiresAt);
     if (isExpired) {
+      await logLoginEvent(req, {
+        vehicleNumber: normalizedVehicle,
+        authRecordId,
+        action: "otp_failed",
+        status: "failure",
+        source: authRecord.otpTracking.source,
+        httpStatus: 400,
+        errorCode: "OTP_EXPIRED",
+        message: "OTP has expired",
+        details: { expiresAt: authRecord.otpTracking.expiresAt },
+      });
       return res.status(400).json({
         success: false,
         message: "OTP has expired. Please initiate login again.",
@@ -69,11 +105,15 @@ const validateOtp = async (req, res) => {
         (authRecord.otpTracking.attempts || 0) + 1;
       await authRecord.save();
 
-      await DriverLoginHistory.create({
+      await logLoginEvent(req, {
         vehicleNumber: normalizedVehicle,
-        authRecordId: authRecord._id,
+        authRecordId,
         action: "otp_failed",
+        status: "failure",
         source: authRecord.otpTracking.source,
+        httpStatus: 400,
+        errorCode: "INVALID_OTP",
+        message: "Invalid OTP",
         details: { attemptsUsed: authRecord.otpTracking.attempts },
       });
 
@@ -222,11 +262,15 @@ const validateOtp = async (req, res) => {
 
       await authRecord.save();
 
-      await DriverLoginHistory.create({
+      await logLoginEvent(req, {
         vehicleNumber: normalizedVehicle,
-        authRecordId: authRecord._id,
+        authRecordId,
         action: "login_success",
-        source: verificationResult.source,
+        status: "success",
+        source: mmtTokenForDualFlow ? "both" : verificationResult.source,
+        httpStatus: 200,
+        message: verificationResult.message || null,
+        externalCalls: [verificationResult.callLog],
         details: {
           token: sessionToken,
           mmtToken: mmtTokenForDualFlow || undefined,
@@ -235,12 +279,17 @@ const validateOtp = async (req, res) => {
       });
     } else {
       // Wise API returned failure after OTP matched locally — log it
-      await DriverLoginHistory.create({
+      await logLoginEvent(req, {
         vehicleNumber: normalizedVehicle,
-        authRecordId: authRecord._id,
+        authRecordId,
         action: "wise_verify_failed",
+        status: "failure",
         source: "wise",
-        details: { message: verificationResult.message },
+        httpStatus: 200, // response below is 200 with success:false / Code:0
+        errorCode: "WISE_VERIFY_FAILED",
+        message: verificationResult.message || null,
+        externalCalls: [verificationResult.callLog],
+        details: { usedNewOtpFormat: shouldUseNewFormat },
       });
     }
 
@@ -288,6 +337,15 @@ const validateOtp = async (req, res) => {
     return res.status(200).json(finalResponse);
   } catch (error) {
     console.error("OTP Validation Error:", error.message);
+    await logLoginEvent(req, {
+      vehicleNumber: normalizeVehicle(req.body?.vehicleNumber),
+      authRecordId,
+      action: "otp_failed",
+      status: "failure",
+      httpStatus: 500,
+      errorCode: "INTERNAL_ERROR",
+      message: error.message,
+    });
     return res
       .status(500)
       .json({ success: false, message: "Internal Server Error" });
@@ -370,43 +428,56 @@ const getOtpByVehicleNumber = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const verifyWiseOtp = async (userId, otp, gcm) => {
-  try {
-    const wiseApiUrl = `${process.env.WISE_BASE_URL}/api/Login/ValidateOtp`;
-
-    const response = await axios.get(wiseApiUrl, {
-      params: {
-        UserID: userId,
-        OTP: otp,
-        gcm: gcm || "dummy_gcm_token",
-        ApiID: process.env.WISE_API_ID || "WSId201",
-        ApiPassword: process.env.WISE_API_PASSWORD || "WSPwd201",
-      },
-      timeout: 5000,
+  const wiseApiUrl = `${process.env.WISE_BASE_URL}/api/Login/ValidateOtp`;
+  const params = {
+    UserID: userId,
+    OTP: otp,
+    gcm: gcm || "dummy_gcm_token",
+    ApiID: process.env.WISE_API_ID || "WSId201",
+    ApiPassword: process.env.WISE_API_PASSWORD || "WSPwd201",
+  };
+  const sentAt = new Date();
+  const record = (extra) =>
+    recordExternalCall({
+      endpoint: "ValidateOtp",
+      url: wiseApiUrl,
+      params,
+      sentAt,
+      ...extra,
     });
 
+  try {
+    const response = await axios.get(wiseApiUrl, { params, timeout: 5000 });
+
     const data = response.data;
+
+    // Code: 1 is the primary factor
+    const success = !!data && data.Code === 1;
+
+    const callLog = record({ response });
+
     if (!data) {
       return {
         success: false,
         source: "wise",
         message: "Empty response from Wise",
+        callLog,
       };
     }
-
-    // Code: 1 is the primary factor
-    const success = data.Code === 1;
 
     if (!success) {
       return {
         success: false,
         source: "wise",
         message: data.Msg || "Wise OTP verification failed",
+        callLog,
       };
     }
 
     return {
       success: true,
       source: "wise",
+      callLog,
       // Use data.Token directly — this is the real Wise session token
       // Never generate a fake token here; Wise API calls require this exact value
       token: data.Token,
@@ -429,6 +500,7 @@ const verifyWiseOtp = async (userId, otp, gcm) => {
       success: false,
       source: "wise",
       message: "Wise service unavailable",
+      callLog: record({ error }),
     };
   }
 };
