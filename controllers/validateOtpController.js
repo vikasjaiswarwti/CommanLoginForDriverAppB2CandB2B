@@ -186,15 +186,13 @@ const validateOtp = async (req, res) => {
 
     // ── STEP 5b: Dual-flow — if Wise succeeded AND MMT also exists ────────────
     // When a vehicle exists in both systems, the Wise OTP is used for validation,
-    // but the MMT session (b2c) must also be opened so the driver can access
-    // MMT-side features without a separate login.
+    // and the MMT session (b2c) is opened with the SAME B2B (Wise) token —
+    // B2B wins, so b2c.token === b2b.token (single effective token).
     const existsInBoth = authRecord.b2c?.exist && authRecord.b2b?.exist;
     let mmtTokenForDualFlow = null;
 
     if (useWise && verificationResult.success && existsInBoth) {
-      mmtTokenForDualFlow = `mmt_${Date.now()}_${Math.random()
-        .toString(36)
-        .substring(2, 15)}`;
+      mmtTokenForDualFlow = verificationResult.token;
     }
 
     // ── STEP 6: Persist result if successful ─────────────────────────────────
@@ -295,12 +293,14 @@ const validateOtp = async (req, res) => {
 
     // ── STEP 7: Respond ──────────────────────────────────────────────────────
     //
-    // Token field  → ALWAYS the Wise token (null for MMT-only)
-    // b2cToken     → ALWAYS the MMT token (present for MMT-only AND both flows)
+    // Single effective token — B2B (Wise) wins over B2C (MMT):
     //
-    // Wise-only : Token = <wise_token>,  b2cToken not present
-    // Both      : Token = <wise_token>,  b2cToken = <mmt_token>
-    // MMT-only  : Token = null,          b2cToken = <mmt_token>
+    // Wise-only : Token = <wise_token>
+    // Both      : Token = <wise_token>   (MMT token still stored on b2c.token)
+    // MMT-only  : Token = <mmt_token>
+    //
+    // verificationResult.token is already the Wise token on the Wise flow and
+    // the MMT token on the MMT-only flow, so it is the effective token as-is.
     //
     const wd = verificationResult.wiseDetails || {};
 
@@ -310,11 +310,7 @@ const validateOtp = async (req, res) => {
       Msg: verificationResult.message || null,
       source: verificationResult.source || null,
       MobileNo: wd.mobileNo || null,
-      // Token is strictly the Wise session token — never an MMT token
-      Token:
-        verificationResult.source === "wise" && verificationResult.success
-          ? verificationResult.token
-          : null,
+      Token: verificationResult.success ? verificationResult.token || null : null,
       AllocationID: wd.allocationId ?? null,
       CabID: wd.cabId ?? null,
       CabNo: wd.cabNo || null,
@@ -324,15 +320,6 @@ const validateOtp = async (req, res) => {
       VendorID: wd.vendorId ?? null,
       BranchID: wd.branchId ?? null,
     };
-
-    // b2cToken is present for MMT-only AND dual-flow (both systems)
-    if (verificationResult.source === "mmt") {
-      // MMT-only: the verificationResult.token is the mmt token
-      finalResponse.b2cToken = verificationResult.token;
-    } else if (mmtTokenForDualFlow) {
-      // Both: separately generated mmt token
-      finalResponse.b2cToken = mmtTokenForDualFlow;
-    }
 
     return res.status(200).json(finalResponse);
   } catch (error) {

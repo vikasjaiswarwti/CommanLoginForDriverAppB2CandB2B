@@ -373,7 +373,7 @@ const loginCommonForDriver = async (req, res) => {
         response.b2bOtpSent = true;
         response.b2bOtpExpiry = otpExpiry;
         // NOTE: Remove b2bOtp in production; here for debugging only
-        response.b2bOtp = wiseOtp;
+        // response.b2bOtp = wiseOtp;
       }
     }
 
@@ -681,8 +681,9 @@ const getCommanAuthDetailOnEveryHit = async (req, res) => {
       b2cToken = authRecord.b2c.token;
     }
 
-    // If B2B token is null → take from DB
-    if (!b2bToken && authRecord?.b2b?.token) {
+    // If B2B token is null → take from DB, but only while the vehicle still
+    // exists in B2B (a stale Wise token must not beat a valid B2C token)
+    if (!b2bToken && authRecord?.b2b?.exist && authRecord?.b2b?.token) {
       b2bToken = authRecord.b2b.token;
     }
 
@@ -700,8 +701,8 @@ const getCommanAuthDetailOnEveryHit = async (req, res) => {
       MobileNo:
         authRecord.mobileNo != null ? String(authRecord.mobileNo) : null,
 
-      // Wise Token (B2B)
-      Token: b2bToken || null,
+      // Single effective token — B2B (Wise) wins, else B2C (MMT)
+      Token: b2bToken || b2cToken || null,
 
       AllocationID: authRecord?.wiseAllocationId ?? null,
       CabID: authRecord?.wiseCabId ?? null,
@@ -715,11 +716,6 @@ const getCommanAuthDetailOnEveryHit = async (req, res) => {
       VendorID: authRecord.vendorId != null ? Number(authRecord.vendorId) : 0,
       BranchID: authRecord.branchId != null ? Number(authRecord.branchId) : 0,
     };
-
-    // Add B2C token separately (MMT token)
-    if (b2cToken) {
-      finalResponse.b2cToken = b2cToken;
-    }
 
     return res.status(200).json(finalResponse);
   } catch (error) {
@@ -916,12 +912,10 @@ const autoLoginToB2BIfExistInMMT = async (req, res) => {
       if (wd.vendorId) record.wiseVendorId = wd.vendorId;
       if (wd.branchId) record.wiseBranchId = wd.branchId;
 
-      // Dual-flow: also open B2C session
+      // Dual-flow: also open B2C session with the same B2B (Wise) token
       if (existInWise) {
         record.b2c.verified = true;
-        record.b2c.token = `mmt_${Date.now()}_${Math.random()
-          .toString(36)
-          .substring(2, 15)}`;
+        record.b2c.token = sessionToken;
       }
     }
 
@@ -959,7 +953,8 @@ const autoLoginToB2BIfExistInMMT = async (req, res) => {
       Msg: "Auto B2B login successful",
       source: verificationResult.source,
       MobileNo: wd.mobileNo || record.driverContact || null,
-      Token: verificationResult.source === "wise" ? sessionToken : null,
+      // Single effective token — Wise token on the Wise flow, else MMT token
+      Token: sessionToken || null,
       AllocationID: wd.allocationId ?? null,
       CabID: wd.cabId ?? null,
       CabNo: wd.cabNo || null,
@@ -969,12 +964,6 @@ const autoLoginToB2BIfExistInMMT = async (req, res) => {
       VendorID: wd.vendorId ?? null,
       BranchID: wd.branchId ?? null,
     };
-
-    if (verificationResult.source === "mmt") {
-      finalResponse.b2cToken = sessionToken;
-    } else if (record.b2c?.token) {
-      finalResponse.b2cToken = record.b2c.token;
-    }
 
     return res.status(200).json(finalResponse);
   } catch (error) {
