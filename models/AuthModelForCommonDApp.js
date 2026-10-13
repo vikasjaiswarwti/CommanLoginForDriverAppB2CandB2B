@@ -4,7 +4,7 @@ const mongoose = require("mongoose");
 const authSubSchema = {
   verified: { type: Boolean, default: false },
   exist: { type: Boolean, default: false },
-  otp: { type: Number },
+  otp: { type: String }, // String: an OTP like "0123" must not lose its leading zero
   token: { type: String, default: "" },
   isNewRegister: { type: Boolean, default: false },
   registerDate: { type: Date },
@@ -72,7 +72,8 @@ const AuthSchemaDefinition = new mongoose.Schema(
 
     // OTP Tracking
     otpTracking: {
-      code: { type: Number },
+      code: { type: String }, // active OTP (wise OTP, or the MMT OTP returned by B2C at login)
+      pending: { type: Boolean, default: false }, // mmt: OTP SMSed by B2C, awaiting verify
       generatedAt: { type: Date },
       expiresAt: { type: Date },
       source: { type: String, enum: ["mmt", "wise"] },

@@ -3,9 +3,6 @@
 const ConfigDrivenDecision = require("../models/ConfigDrivenDecision");
 const AuthModelForCommonDApp = require("../models/AuthModelForCommonDApp");
 const DriverLoginHistory = require("../models/DriverLoginHistory");
-const { Driver } = require("../models/DriverModel");
-const { Vehicle } = require("../models/VehicleModel");
-const { Mobileotp } = require("../models/MobileOtp");
 const axios = require("axios");
 const { verifyWiseOtp } = require("./validateOtpController");
 const time = require("../utils/time");
@@ -119,20 +116,18 @@ const loginCommonForDriver = async (req, res) => {
       `${time.tds()} [OTP-SERVICE] WISE OTP service result: existInWise=${existInWise}, wiseCode=${wiseCode}, otpReceived=${!!wiseOtp}, wiseFlowActive=${wiseFlowActive}`,
     );
 
-    // ── STEP 2: Only now call MMT, telling it whether to send its own OTP ────
-    // If the vehicle exists in Wise at all, MMT is looked up for identity
-    // fields only — no SMS. MMT OTP is generated ONLY when the vehicle does
-    // NOT exist in Wise (i.e. MMT-only). Using existInWise here (rather than
-    // wiseFlowActive) means the MMT OTP stays skipped even in the edge case
-    // where Wise returns code:1 without an otp value.
-    // We await this fully before moving on, so we always know for certain
-    // whether the MMT OTP was actually sent before building the response.
+    // ── STEP 2: Call the MMT (B2C) backend — always, whether or not Wise has it
+    // Both systems are checked so we know Wise only / MMT only / both. B2C's
+    // loginDriver generates an OTP and returns it. When the vehicle is in Wise,
+    // Wise already texted the driver and the Wise OTP wins, so we ask B2C to
+    // skip its SMS (skipSms: true) — the driver gets a single SMS. For an
+    // MMT-only vehicle the SMS is sent as usual.
     console.log(
-      `${time.tds()} [OTP-SERVICE] loginCommonForDriver: calling MMT OTP service for vehicle=${normalizedVehicle}, sendOtp=${!existInWise}`,
+      `${time.tds()} [OTP-SERVICE] loginCommonForDriver: calling MMT OTP service for vehicle=${normalizedVehicle}, skipSms=${existInWise}`,
     );
     const mmtResult = await loginDriverForMMTService(
       normalizedVehicle,
-      !existInWise,
+      existInWise,
     ).catch((err) => ({ __rejected: true, err }));
 
     const mmtData = mmtResult?.__rejected
@@ -143,7 +138,7 @@ const loginCommonForDriver = async (req, res) => {
         }
       : mmtResult;
 
-    console.log("mmtData", mmtData);
+    externalCalls.push(mmtData.callLog);
 
     const existInMmt = mmtData.existInMmt || false;
 
@@ -202,20 +197,21 @@ const loginCommonForDriver = async (req, res) => {
       return failLogin(404, "VEHICLE_NOT_FOUND", "Vehicle not found in any system");
     }
 
-    const activeOtp = wiseFlowActive ? wiseOtp : mmtData.generatedOtp || null;
+    // Wise OTP wins when active. Otherwise the MMT OTP (SMSed by B2C, never
+    // visible to us) is the active one — it is verified through B2C later.
     const activeSource = wiseFlowActive ? "wise" : "mmt";
+    // MMT OTP is stored only if B2C returned it in the loginDriver response
+    // (mmtData.generatedOtp); otherwise it is null and B2C verifies it later.
+    const activeOtp = wiseFlowActive ? wiseOtp : mmtData.generatedOtp || null;
+    // The MMT OTP only counts when the vehicle is NOT in Wise (MMT-only).
+    const otpIssued =
+      wiseFlowActive || (existInMmt && !existInWise && !!mmtData.otpSent);
 
     // ── Vehicle exists but no OTP could be issued — don't pretend success ────
-    // MMT: SMS gateway failed (e.g. 403 when server IP is not whitelisted).
-    // Wise: code:1 but no otp in the response, and MMT OTP was skipped.
-    if (!activeOtp) {
-      if (!existInWise && mmtData.reason === "OTP_SEND_FAILED") {
-        return failLogin(
-          502,
-          "OTP_SEND_FAILED",
-          "Vehicle found but the OTP could not be sent. Please try again.",
-        );
-      }
+    // Wise: code:1 but no otp in the response (MMT OTP is not used when the
+    // vehicle is in Wise). B2C swallows SMS-gateway failures and still answers
+    // 200, so an MMT-side send failure cannot be detected from here.
+    if (!otpIssued) {
       return failLogin(
         502,
         "OTP_NOT_AVAILABLE",
@@ -228,16 +224,29 @@ const loginCommonForDriver = async (req, res) => {
     );
 
     // ── Driver identity ──────────────────────────────────────────────────────
-    const driverContact = existInMmt ? mmtData.driverContact : null;
-    const driverName = existInMmt ? mmtData.driverName : null;
-    const driverId = existInMmt ? mmtData.driverId : null;
+    // B2C's loginDriver returns only the vehicle id — no driver contact, name
+    // or id. They stay null until Wise OTP verification supplies a mobile
+    // number; existing records keep whatever they already have.
+    const driverContact = null;
+    const driverName = null;
+    const driverId = null;
 
     const uniqueId = existInMmt
-      ? `${normalizedVehicle}_${driverContact}`
+      ? `mmt_${normalizedVehicle}`
       : `wise_${normalizedVehicle}`;
 
     const now = new Date();
     const otpExpiry = new Date(now.getTime() + 5 * 60_000);
+
+    // wise → we hold the code; mmt → B2C holds it, we only mark one as pending
+    const buildOtpTracking = () => ({
+      code: activeOtp,
+      pending: activeSource === "mmt",
+      generatedAt: now,
+      expiresAt: otpExpiry,
+      source: activeSource,
+      attempts: 0,
+    });
 
     // ── Find or create auth record ───────────────────────────────────────────
     let authRecord = await AuthModelForCommonDApp.findOne({
@@ -255,7 +264,7 @@ const loginCommonForDriver = async (req, res) => {
         b2c: {
           exist: existInMmt,
           verified: false,
-          otp: existInMmt ? mmtData.generatedOtp : null,
+          otp: existInMmt ? mmtData.generatedOtp || null : null,
           token: "",
           isNewRegister: false,
         },
@@ -271,15 +280,7 @@ const loginCommonForDriver = async (req, res) => {
         wiseUserId: existInWise ? normalizedVehicle : null,
         wiseGcm: gcm || null,
 
-        otpTracking: activeOtp
-          ? {
-              code: activeOtp,
-              generatedAt: now,
-              expiresAt: otpExpiry,
-              source: activeSource,
-              attempts: 0,
-            }
-          : null,
+        otpTracking: buildOtpTracking(),
       });
     } else {
       // ── UPDATE ───────────────────────────────────────────────────────────────
@@ -287,11 +288,7 @@ const loginCommonForDriver = async (req, res) => {
       authRecord.b2b.exist = existInWise;
 
       if (existInMmt) {
-        authRecord.driverContact = mmtData.driverContact;
-        authRecord.driver.contact = mmtData.driverContact;
-        authRecord.driver.name = mmtData.driverName;
-        authRecord.driver.driverId = mmtData.driverId;
-        authRecord.b2c.otp = mmtData.generatedOtp;
+        authRecord.b2c.otp = mmtData.generatedOtp || null;
       }
 
       if (existInWise) {
@@ -301,15 +298,7 @@ const loginCommonForDriver = async (req, res) => {
       }
 
       // Always overwrite otpTracking — Wise OTP wins when wiseFlowActive
-      if (activeOtp) {
-        authRecord.otpTracking = {
-          code: activeOtp,
-          generatedAt: now,
-          expiresAt: otpExpiry,
-          source: activeSource,
-          attempts: 0,
-        };
-      }
+      authRecord.otpTracking = buildOtpTracking();
     }
 
     // Config flag stored for record-keeping — does NOT influence OTP source
@@ -335,8 +324,7 @@ const loginCommonForDriver = async (req, res) => {
         b2bExists: existInWise,
         otpSource: activeSource,
         wiseFlowActive,
-        otpSent: !!activeOtp,
-        mmtOtpSkipped: !!mmtData.otpSkipped,
+        otpSent: otpIssued,
         mmtReason: mmtData.reason || mmtData.error || null,
       },
     });
@@ -347,7 +335,7 @@ const loginCommonForDriver = async (req, res) => {
       existInMmt,
       existInWise,
       vehicleId: mmtData.vehicleId || null,
-      driverContact,
+      driverContact: authRecord.driverContact ?? null,
       message: "Driver login flow initiated",
       driverSource: existInMmt ? "mmt" : "wise",
       useWiseOtp: wiseFlowActive,
@@ -357,8 +345,8 @@ const loginCommonForDriver = async (req, res) => {
       response.b2c = {
         exist: true,
         verified: false,
-        otpSent: !!mmtData.generatedOtp,
-        otpExpiry: mmtData.generatedOtp ? otpExpiry : null,
+        otpSent: !!mmtData.otpSent,
+        otpExpiry: mmtData.otpSent ? otpExpiry : null,
       };
     }
 
@@ -400,81 +388,88 @@ const loginCommonForDriver = async (req, res) => {
 // MMT service login
 // ─────────────────────────────────────────────
 
-const loginDriverForMMTService = async (vehicleNumber, sendOtp = true) => {
-  try {
-    const foundVehicle = await Vehicle.findOne({
-      VehicleNumber: vehicleNumber,
+// B2C (MMT) backend, reached over HTTP — no direct DB access.
+//
+// POST {MMT_BASE_URL}/0auth/Auth/loginDriver { VehicleNumber }
+//   200 { Vehicleid }  → vehicle + active driver exist, 4-digit OTP SMSed
+//   404 { message }    → "Vehicle not found" | "no Active Driver to this
+//                        Vehicle" | "this dRiver id not exist in driver db"
+// B2C returns only Vehicleid — never the OTP, driver contact or name. The OTP
+// is verified later through B2C's verifyOtpMobile (verifyMmtOtp in
+// validateOtpController). B2C swallows SMS-gateway failures and still answers 200.
+const loginDriverForMMTService = async (vehicleNumber, skipSms = false) => {
+  const mmtApiUrl = `${process.env.MMT_BASE_URL}/0auth/Auth/loginDriver`;
+  // skipSms: true → B2C generates + saves + returns the OTP but sends no SMS.
+  // Key omitted → unchanged behaviour (SMS is sent).
+  const body = skipSms
+    ? { VehicleNumber: vehicleNumber, skipSms: true }
+    : { VehicleNumber: vehicleNumber };
+  const sentAt = new Date();
+  const record = (extra) =>
+    recordExternalCall({
+      service: "mmt",
+      endpoint: "loginDriver",
+      method: "POST",
+      url: mmtApiUrl,
+      params: body,
+      sentAt,
+      ...extra,
     });
-    if (!foundVehicle)
-      return { success: false, existInMmt: false, reason: "VEHICLE_NOT_FOUND" };
 
-    const activeDriver = foundVehicle.ActiveDriver;
-    if (!activeDriver)
-      return { success: false, existInMmt: false, reason: "NO_ACTIVE_DRIVER" };
-
-    const foundDriver = await Driver.findById(activeDriver);
-    if (!foundDriver)
-      return { success: false, existInMmt: false, reason: "DRIVER_NOT_FOUND" };
-
-    // Wise already won this login (or caller doesn't want an OTP) — return
-    // identity fields only, without generating/sending a second MMT OTP.
-    if (!sendOtp) {
-      console.log(
-        `${time.tds()} [OTP-SERVICE] MMT OTP generation SKIPPED for vehicle=${vehicleNumber} (Wise OTP already active)`,
-      );
-      return {
-        success: true,
-        existInMmt: true,
-        vehicleId: foundVehicle._id,
-        driverId: foundDriver._id,
-        driverContact: foundDriver.MobileNumber,
-        driverName: foundDriver.Name,
-        generatedOtp: null,
-        otpSkipped: true,
-      };
-    }
-
+  try {
     console.log(
-      `${time.tds()} [OTP-SERVICE] Invoking MMT OTP service (generateOtpMobile) for vehicle=${vehicleNumber}, mobile=${foundDriver.MobileNumber}`,
-    );
-    // const otp = Math.floor(100000 + Math.random() * 900000);
-    const generatedOtp = await generateOtpMobile(
-      foundDriver.MobileNumber,
-      vehicleNumber,
+      `${time.tds()} [OTP-SERVICE] MMT loginDriver API called (skipSms=${skipSms}) for vehicle=${vehicleNumber}, url=${mmtApiUrl}`,
     );
 
-    // Vehicle + driver DO exist in MMT — only the OTP/SMS step failed.
-    // Keep existInMmt: true so the caller doesn't report "not found".
-    if (!generatedOtp) {
+    const response = await axios.post(mmtApiUrl, body, {
+      timeout: Number(process.env.MMT_TIMEOUT_MS) || 5000,
+    });
+    const callLog = record({ response });
+
+    // 200 { Vehicleid } is the ONLY indicator that the vehicle exists in MMT
+    if (!response.data?.Vehicleid) {
       return {
         success: false,
-        existInMmt: true,
-        vehicleId: foundVehicle._id,
-        driverId: foundDriver._id,
-        driverContact: foundDriver.MobileNumber,
-        driverName: foundDriver.Name,
-        generatedOtp: null,
-        reason: "OTP_SEND_FAILED",
-        error: "Failed to generate/send OTP in MMT",
+        existInMmt: false,
+        reason: "MMT_ERROR",
+        error: "MMT loginDriver returned no Vehicleid",
+        callLog,
       };
     }
 
     return {
       success: true,
       existInMmt: true,
-      vehicleId: foundVehicle._id,
-      driverId: foundDriver._id,
-      driverContact: foundDriver.MobileNumber,
-      driverName: foundDriver.Name,
-      generatedOtp: generatedOtp,
+      vehicleId: response.data.Vehicleid,
+      otpSent: !skipSms, // false when B2C was told not to send the SMS
+      // B2C's loginDriver answers { Vehicleid, VehicleNumber, otp }. The OTP
+      // is stored and checked locally, exactly like the Wise OTP. Kept as a
+      // string so a leading zero survives.
+      generatedOtp:
+        response.data.otp != null ? String(response.data.otp).trim() : null,
+      callLog,
     };
   } catch (err) {
-    console.error("MMT login error:", err.message);
+    const callLog = record({ error: err });
+    console.error(
+      `${time.tds()} [OTP-SERVICE] MMT loginDriver failed for vehicle=${vehicleNumber}: code=${err.code}, status=${err.response?.status ?? "-"}, msg=${err.message}`,
+    );
+
+    if (err.response?.status === 404) {
+      const msg = String(err.response.data?.message || "").toLowerCase();
+      let reason = "VEHICLE_NOT_FOUND";
+      if (msg.includes("no active driver")) reason = "NO_ACTIVE_DRIVER";
+      else if (msg.includes("driver id not exist")) reason = "DRIVER_NOT_FOUND";
+      return { success: false, existInMmt: false, reason, callLog };
+    }
+
+    // timeout / network / 5xx — NOT "vehicle not found"
     return {
       success: false,
       existInMmt: false,
       reason: "MMT_ERROR",
       error: err.message,
+      callLog,
     };
   }
 };
@@ -559,92 +554,6 @@ const loginDriverForWiseService = async (vehicleNumber, gcm) => {
       };
     }
     return { success: false, existInWise: false, error: err.message, callLog };
-  }
-};
-
-const generateOtpMobile = async (mobile, VehicleNumber) => {
-  try {
-    const normalizedVehicle = VehicleNumber.toLowerCase();
-
-    const isTestVehicle = normalizedVehicle === "testvehicle12345";
-
-    const currentOtp = await Mobileotp.findOne({
-      VehicleNumber: VehicleNumber.toLowerCase(),
-    });
-
-    if (currentOtp) {
-      await Mobileotp.deleteMany({
-        VehicleNumber: VehicleNumber.toLowerCase(),
-      });
-      console.log(
-        time.tds(),
-
-        `generateOtpMobile()-- Previous otp deleted`,
-      );
-    }
-
-    // const newOTP = isTestVehicle
-    //   ? "123456"
-    //   : `${Math.floor(1000 + Math.random() * 9000)}`;
-
-    let newOTP;
-    if (isTestVehicle) {
-      newOTP = "123456"; // 6-digit for test vehicle
-      console.log("Test vehicle detected - using hardcoded OTP:", newOTP);
-    } else {
-      // Generate 6-digit OTP to match what loginDriverForMMTService expects
-      newOTP = Math.floor(100000 + Math.random() * 900000).toString();
-      console.log("Regular vehicle - generated OTP:", newOTP);
-    }
-
-    console.log("isTestVehicle", isTestVehicle);
-    console.log("newOTP", newOTP);
-
-    // const hashedOtp=await bcrypt.hash(newOTP,10);
-    const vehicle = await Vehicle.findOne({
-      VehicleNumber: VehicleNumber.toLowerCase(),
-    });
-
-    const newOtp = new Mobileotp({
-      VehicleNumber: VehicleNumber.toLowerCase(),
-      otp: newOTP,
-      createdAt: new Date(),
-      expireAt: new Date(Date.now() + 30 * 60 * 1000), // 30 minutes from now
-      vendorid: vehicle?.VendorId || null,
-    });
-
-    await newOtp.save();
-    console.log(
-      time.tds(),
-
-      `generateOtpMobile()-- new otp saved`,
-    );
-
-    if (!isTestVehicle) {
-      console.log(
-        `${time.tds()} [OTP-SERVICE] MMT SMS gateway (myvfirst) called for mobile=${mobile}, vehicle=${VehicleNumber}`,
-      );
-      const externalApiUrl = `https://http.myvfirst.com/smpp/sendsms?username=wheelzonrent&password=wheel123&to=${mobile}&udh=0&from=wticab&text=Dear customer Your OTP for WTi Cabs Login is ${newOTP} Thanks WTICABS&action=send&category=bulk`;
-      const response = await axios.get(externalApiUrl);
-
-      console.log("response after generating mobile otp", response);
-    } else {
-      console.log(
-        `${time.tds()} [OTP-SERVICE] MMT SMS gateway SKIPPED for test vehicle=${VehicleNumber} (hardcoded OTP used)`,
-      );
-    }
-
-    // server ip need to be whitelist as hit ges to ser
-
-    // console.log(response.data);
-    return newOTP;
-  } catch (err) {
-    console.log(
-      time.tds(),
-
-      `generateOtpMobile()-- some error occur  ${err.message}`,
-    );
-    return;
   }
 };
 
@@ -740,18 +649,9 @@ const autoLoginToB2BIfExistInMMT = async (req, res) => {
 
     const normalizedVehicle = vehicleNumber.toLowerCase().replace(/\s/g, "");
 
-    // ── STEP 1: Check if vehicle exists in MMT ───────────────────────────────
-    const foundVehicle = await Vehicle.findOne({
-      VehicleNumber: normalizedVehicle,
-    });
-
-    if (!foundVehicle) {
-      return res.status(404).json({
-        success: false,
-        message: "Vehicle not found in MMT system",
-        neverLoggedAsB2C: true,
-      });
-    }
+    // ── STEP 1: (MMT existence) ──────────────────────────────────────────────
+    // The Vehicle DB lookup is gone. B2C's loginDriver sends an SMS, so
+    // existence is inferred from a past successful B2C login (STEP 3).
 
     // ── STEP 2: Get GCM from auth model ─────────────────────────────────────
     const authRecord = await AuthModelForCommonDApp.findOne({

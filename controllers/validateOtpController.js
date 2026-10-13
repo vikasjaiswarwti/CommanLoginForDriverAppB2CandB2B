@@ -58,7 +58,12 @@ const validateOtp = async (req, res) => {
     const useWise = authRecord.otpTracking?.source === "wise";
 
     // ── STEP 3: Basic guards ─────────────────────────────────────────────────
-    if (!authRecord.otpTracking || !authRecord.otpTracking.code) {
+    // wise: we hold the code. mmt: B2C holds it, we only track "pending".
+    const hasActiveOtp = useWise
+      ? !!authRecord.otpTracking?.code
+      : !!authRecord.otpTracking?.pending;
+
+    if (!authRecord.otpTracking || !hasActiveOtp) {
       await logLoginEvent(req, {
         vehicleNumber: normalizedVehicle,
         authRecordId,
@@ -96,11 +101,14 @@ const validateOtp = async (req, res) => {
       });
     }
 
-    // ── STEP 4: Validate submitted OTP against stored otpTracking.code ────────
-    const storedOtp = String(authRecord.otpTracking.code).trim();
+    // ── STEP 4: Validate submitted OTP ───────────────────────────────────────
+    // wise → compare with our stored otpTracking.code first (Wise re-checks in
+    //        step 5). mmt → the OTP lives in the B2C backend; B2C verifies it
+    //        in step 5, so there is nothing to compare locally.
     const submittedOtp = String(otp).trim();
 
-    if (storedOtp !== submittedOtp) {
+    // Shared "wrong OTP" response (same shape as before) + attempts counter
+    const rejectInvalidOtp = async (externalCalls = []) => {
       authRecord.otpTracking.attempts =
         (authRecord.otpTracking.attempts || 0) + 1;
       await authRecord.save();
@@ -114,6 +122,7 @@ const validateOtp = async (req, res) => {
         httpStatus: 400,
         errorCode: "INVALID_OTP",
         message: "Invalid OTP",
+        externalCalls,
         details: { attemptsUsed: authRecord.otpTracking.attempts },
       });
 
@@ -123,14 +132,22 @@ const validateOtp = async (req, res) => {
         code: "INVALID_OTP",
         attemptsUsed: authRecord.otpTracking.attempts,
       });
+    };
+
+    // A stored code exists for Wise always, and for MMT when B2C returned the
+    // OTP at login. With a stored code we compare locally, as for Wise.
+    const hasLocalCode = !!authRecord.otpTracking.code;
+
+    if (hasLocalCode && String(authRecord.otpTracking.code).trim() !== submittedOtp) {
+      return rejectInvalidOtp();
     }
 
     // ── STEP 5: OTP matched — complete auth via the correct flow ─────────────
     //
     // MMT flow:
-    //   OTP validated above against stored code — no external call needed.
-    //   Vehicle does NOT exist in Wise so there is nothing to call.
-    //   Issue a session token directly.
+    //   Call the B2C backend's verifyOtpMobile (verifyMmtOtp below) — B2C owns
+    //   the OTP. Vehicle does NOT exist in Wise so there is nothing else to
+    //   call. On success we issue our own session token.
     //
     // Wise flow:
     //   MUST call Wise ValidateOtp API because:
@@ -175,13 +192,59 @@ const validateOtp = async (req, res) => {
         authRecord.wiseGcm || gcm,
       );
     } else {
-      // MMT only — OTP already verified, issue token directly
-      verificationResult = {
-        success: true,
-        source: "mmt",
-        token: `mmt_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`,
-        message: "OTP verified successfully",
-      };
+      // MMT only. If the OTP was stored at login it was just matched locally;
+      // otherwise B2C verifies it. Either way we issue the session token.
+      verificationResult = hasLocalCode
+        ? {
+            success: true,
+            source: "mmt",
+            token: `mmt_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`,
+            message: "OTP verified successfully",
+          }
+        : await verifyMmtOtp(normalizedVehicle, submittedOtp);
+
+      if (!verificationResult.success) {
+        if (verificationResult.reason === "MMT_UNAVAILABLE") {
+          await logLoginEvent(req, {
+            vehicleNumber: normalizedVehicle,
+            authRecordId,
+            action: "otp_failed",
+            status: "failure",
+            source: "mmt",
+            httpStatus: 503,
+            errorCode: "MMT_UNAVAILABLE",
+            message: verificationResult.message,
+            externalCalls: [verificationResult.callLog],
+          });
+          return res.status(503).json({
+            success: false,
+            message: "Could not verify the OTP right now. Please try again.",
+            code: "MMT_UNAVAILABLE",
+          });
+        }
+
+        if (verificationResult.reason === "NO_OTP_FOUND") {
+          await logLoginEvent(req, {
+            vehicleNumber: normalizedVehicle,
+            authRecordId,
+            action: "otp_failed",
+            status: "failure",
+            source: "mmt",
+            httpStatus: 400,
+            errorCode: "NO_OTP_FOUND",
+            message: verificationResult.message,
+            externalCalls: [verificationResult.callLog],
+          });
+          return res.status(400).json({
+            success: false,
+            message: "No active OTP found. Please initiate login again.",
+            code: "NO_OTP_FOUND",
+          });
+        }
+
+        // INVALID_OTP — B2C answers 204 for both a wrong and an expired OTP
+        return rejectInvalidOtp([verificationResult.callLog]);
+      }
     }
 
     // ── STEP 5b: Dual-flow — if Wise succeeded AND MMT also exists ────────────
@@ -250,6 +313,7 @@ const validateOtp = async (req, res) => {
 
       // Clear OTP now that session is open
       authRecord.otpTracking.code = null;
+      authRecord.otpTracking.pending = false;
 
       authRecord.activeSession = {
         token: sessionToken,
@@ -492,4 +556,93 @@ const verifyWiseOtp = async (userId, otp, gcm) => {
   }
 };
 
-module.exports = { validateOtp, verifyWiseOtp, getOtpByVehicleNumber };
+// ─────────────────────────────────────────────────────────────────────────────
+// MMT (B2C) OTP verification — mirrors verifyWiseOtp
+//
+// POST {MMT_BASE_URL}/0auth/DriverApp/verifyOtpMobile { VehicleNumber, otp }
+//   201 { otpValid: true }  → correct (OTP consumed)
+//   401                     → no OTP stored for this vehicle
+//   204 (no body)           → wrong OR expired (B2C does not say which)
+//   500                     → internal error
+// B2C never returns a session token, so one is issued here on success.
+// Pass the SAME normalized vehicle number that was sent to loginDriver.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const verifyMmtOtp = async (vehicleNumber, otp) => {
+  const mmtApiUrl = `${process.env.MMT_BASE_URL}/0auth/DriverApp/verifyOtpMobile`;
+  const body = { VehicleNumber: vehicleNumber, otp: String(otp).trim() };
+  const sentAt = new Date();
+  const record = (extra) =>
+    recordExternalCall({
+      service: "mmt",
+      endpoint: "verifyOtpMobile",
+      method: "POST",
+      url: mmtApiUrl,
+      params: body,
+      sentAt,
+      ...extra,
+    });
+
+  try {
+    const response = await axios.post(mmtApiUrl, body, {
+      timeout: Number(process.env.MMT_TIMEOUT_MS) || 5000,
+      // 401 / 204 are normal answers here, not transport errors
+      validateStatus: (status) => status < 500,
+    });
+    const callLog = record({ response });
+
+    if (response.status === 201 && response.data?.otpValid === true) {
+      return {
+        success: true,
+        source: "mmt",
+        callLog,
+        token: `mmt_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`,
+        message: "OTP verified successfully",
+      };
+    }
+
+    if (response.status === 401) {
+      return {
+        success: false,
+        source: "mmt",
+        reason: "NO_OTP_FOUND",
+        message: "No active OTP found in MMT",
+        callLog,
+      };
+    }
+
+    if (response.status === 204) {
+      return {
+        success: false,
+        source: "mmt",
+        reason: "INVALID_OTP",
+        message: "OTP wrong or expired in MMT",
+        callLog,
+      };
+    }
+
+    return {
+      success: false,
+      source: "mmt",
+      reason: "MMT_UNAVAILABLE",
+      message: `Unexpected MMT response ${response.status}`,
+      callLog,
+    };
+  } catch (error) {
+    console.error("MMT OTP verification error:", error.message);
+    return {
+      success: false,
+      source: "mmt",
+      reason: "MMT_UNAVAILABLE",
+      message: error.message,
+      callLog: record({ error }),
+    };
+  }
+};
+
+module.exports = {
+  validateOtp,
+  verifyWiseOtp,
+  verifyMmtOtp,
+  getOtpByVehicleNumber,
+};
