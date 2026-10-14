@@ -27,6 +27,8 @@ const {
   getDriverOnOffStatus,
 } = require("../controllers/dutyController");
 
+const { fetchBookingList } = require("../controllers/bookingController");
+
 const DriverAppAuthRouter = Router(); // Create an instance of the Router
 
 // login
@@ -84,5 +86,9 @@ DriverAppAuthRouter.post(
 );
 
 DriverAppAuthRouter.post("/get-driver-on-off-status", getDriverOnOffStatus);
+
+// booking list — Wise (B2B) + MMT (B2C) merged, newest first.
+// Same query as Wise BookingList: AllocationID, Gcm, Month, CabId, userid, token
+DriverAppAuthRouter.get("/fetch-booking-list", fetchBookingList);
 
 module.exports = DriverAppAuthRouter; // Export the router instance directly
