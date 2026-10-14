@@ -8,11 +8,14 @@ const time = require("./time");
 // Matched case-insensitively (Wise uses both ApiPassword and apipassword).
 const MASKED_PARAMS = ["apipassword"];
 
-const maskParams = (params) => {
+// extraKeys: per-call additions (e.g. the SMS gateway's "password"; not global,
+// since Wise ValidateUser sends a literal password=0 that should stay visible)
+const maskParams = (params, extraKeys = []) => {
   if (!params || typeof params !== "object") return params;
+  const masked = [...MASKED_PARAMS, ...extraKeys.map((k) => k.toLowerCase())];
   const copy = { ...params };
   for (const key of Object.keys(copy)) {
-    if (MASKED_PARAMS.includes(key.toLowerCase()) && copy[key] !== undefined)
+    if (masked.includes(key.toLowerCase()) && copy[key] !== undefined)
       copy[key] = "***";
   }
   return copy;
@@ -33,6 +36,7 @@ const recordExternalCall = ({
   url,
   params,
   body,
+  maskKeys = [],
   sentAt,
   response,
   error,
@@ -45,8 +49,8 @@ const recordExternalCall = ({
     request: {
       method,
       url,
-      params: maskParams(params) || {},
-      ...(body !== undefined ? { body: maskParams(body) } : {}),
+      params: maskParams(params, maskKeys) || {},
+      ...(body !== undefined ? { body: maskParams(body, maskKeys) } : {}),
       sentAt,
     },
     response: res

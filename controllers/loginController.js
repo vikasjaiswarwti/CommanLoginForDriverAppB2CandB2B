@@ -6,6 +6,7 @@ const DriverLoginHistory = require("../models/DriverLoginHistory");
 const axios = require("axios");
 const { verifyWiseOtp } = require("./validateOtpController");
 const time = require("../utils/time");
+const { sendLoginOtpSms } = require("../utils/smsGateway");
 const {
   recordExternalCall,
   logLoginEvent,
@@ -118,17 +119,16 @@ const loginCommonForDriver = async (req, res) => {
 
     // ── STEP 2: Call the MMT (B2C) backend — always, whether or not Wise has it
     // Both systems are checked so we know Wise only / MMT only / both. B2C's
-    // loginDriver generates an OTP and returns it. When the vehicle is in Wise,
-    // Wise already texted the driver and the Wise OTP wins, so we ask B2C to
-    // skip its SMS (skipSms: true) — the driver gets a single SMS. For an
-    // MMT-only vehicle the SMS is sent as usual.
+    // loginDriver generates an OTP and returns it, always with skipSms: true.
+    // When the vehicle is in Wise, Wise already texted the driver and the Wise
+    // OTP wins. For an MMT-only vehicle this service texts the MMT OTP itself
+    // (STEP 3) — the driver gets exactly one SMS either way.
     console.log(
-      `${time.tds()} [OTP-SERVICE] loginCommonForDriver: calling MMT OTP service for vehicle=${normalizedVehicle}, skipSms=${existInWise}`,
+      `${time.tds()} [OTP-SERVICE] loginCommonForDriver: calling MMT OTP service for vehicle=${normalizedVehicle}, skipSms=true`,
     );
-    const mmtResult = await loginDriverForMMTService(
-      normalizedVehicle,
-      existInWise,
-    ).catch((err) => ({ __rejected: true, err }));
+    const mmtResult = await loginDriverForMMTService(normalizedVehicle).catch(
+      (err) => ({ __rejected: true, err }),
+    );
 
     const mmtData = mmtResult?.__rejected
       ? {
@@ -203,14 +203,43 @@ const loginCommonForDriver = async (req, res) => {
     // MMT OTP is stored only if B2C returned it in the loginDriver response
     // (mmtData.generatedOtp); otherwise it is null and B2C verifies it later.
     const activeOtp = wiseFlowActive ? wiseOtp : mmtData.generatedOtp || null;
+
+    // ── STEP 3: MMT-only — text the MMT OTP to the driver ourselves ──────────
+    // B2C was told skipSms:true, so nobody else will send it. Only for
+    // vehicles NOT in Wise (Wise vehicles already got Wise's SMS).
+    if (existInMmt && !existInWise && mmtData.generatedOtp) {
+      if (!mmtData.mobile) {
+        return failLogin(
+          502,
+          "MMT_MOBILE_MISSING",
+          "Vehicle found but the driver's mobile number is not available to send the OTP.",
+        );
+      }
+
+      const sms = await sendLoginOtpSms({
+        mobile: mmtData.mobile,
+        otp: mmtData.generatedOtp,
+        vehicleNumber: normalizedVehicle,
+      });
+      externalCalls.push(sms.callLog);
+
+      if (!sms.success) {
+        return failLogin(
+          502,
+          "OTP_SEND_FAILED",
+          "Vehicle found but the OTP could not be sent. Please try again.",
+        );
+      }
+      mmtData.otpSent = true;
+    }
+
     // The MMT OTP only counts when the vehicle is NOT in Wise (MMT-only).
     const otpIssued =
       wiseFlowActive || (existInMmt && !existInWise && !!mmtData.otpSent);
 
     // ── Vehicle exists but no OTP could be issued — don't pretend success ────
     // Wise: code:1 but no otp in the response (MMT OTP is not used when the
-    // vehicle is in Wise). B2C swallows SMS-gateway failures and still answers
-    // 200, so an MMT-side send failure cannot be detected from here.
+    // vehicle is in Wise). MMT-only: B2C returned no OTP to text.
     if (!otpIssued) {
       return failLogin(
         502,
@@ -224,10 +253,11 @@ const loginCommonForDriver = async (req, res) => {
     );
 
     // ── Driver identity ──────────────────────────────────────────────────────
-    // B2C's loginDriver returns only the vehicle id — no driver contact, name
-    // or id. They stay null until Wise OTP verification supplies a mobile
-    // number; existing records keep whatever they already have.
-    const driverContact = null;
+    // B2C's loginDriver returns the driver's MobileNumber (used for the SMS);
+    // name and id are not returned. Otherwise contact stays null until Wise
+    // OTP verification supplies a mobile number.
+    const driverContact =
+      existInMmt && mmtData.mobile ? Number(mmtData.mobile) : null;
     const driverName = null;
     const driverId = null;
 
@@ -289,6 +319,10 @@ const loginCommonForDriver = async (req, res) => {
 
       if (existInMmt) {
         authRecord.b2c.otp = mmtData.generatedOtp || null;
+        if (driverContact) {
+          authRecord.driverContact = driverContact;
+          authRecord.driver.contact = driverContact;
+        }
       }
 
       if (existInWise) {
@@ -397,13 +431,13 @@ const loginCommonForDriver = async (req, res) => {
 // B2C returns only Vehicleid — never the OTP, driver contact or name. The OTP
 // is verified later through B2C's verifyOtpMobile (verifyMmtOtp in
 // validateOtpController). B2C swallows SMS-gateway failures and still answers 200.
-const loginDriverForMMTService = async (vehicleNumber, skipSms = false) => {
+const loginDriverForMMTService = async (vehicleNumber) => {
   const mmtApiUrl = `${process.env.MMT_BASE_URL}/0auth/Auth/loginDriver`;
-  // skipSms: true → B2C generates + saves + returns the OTP but sends no SMS.
-  // Key omitted → unchanged behaviour (SMS is sent).
-  const body = skipSms
-    ? { VehicleNumber: vehicleNumber, skipSms: true }
-    : { VehicleNumber: vehicleNumber };
+  // skipSms: true ALWAYS → B2C generates + saves + returns the OTP but never
+  // texts. This service sends the SMS itself (utils/smsGateway) for MMT-only
+  // vehicles; Wise vehicles are texted by Wise.
+  const skipSms = true;
+  const body = { VehicleNumber: vehicleNumber, skipSms };
   const sentAt = new Date();
   const record = (extra) =>
     recordExternalCall({
@@ -441,7 +475,13 @@ const loginDriverForMMTService = async (vehicleNumber, skipSms = false) => {
       success: true,
       existInMmt: true,
       vehicleId: response.data.Vehicleid,
-      otpSent: !skipSms, // false when B2C was told not to send the SMS
+      otpSent: false, // B2C never texts — set by the caller once our SMS goes out
+      // Driver's mobile, needed to text the OTP. B2C must include it in the
+      // loginDriver response as MobileNumber.
+      mobile:
+        response.data.MobileNumber != null
+          ? String(response.data.MobileNumber).trim()
+          : null,
       // B2C's loginDriver answers { Vehicleid, VehicleNumber, otp }. The OTP
       // is stored and checked locally, exactly like the Wise OTP. Kept as a
       // string so a leading zero survives.

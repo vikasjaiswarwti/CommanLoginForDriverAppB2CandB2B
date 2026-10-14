@@ -10,7 +10,8 @@ const mongoose = require("mongoose");
 
 const ExternalCallSchema = new mongoose.Schema(
   {
-    service: { type: String, enum: ["wise", "mmt"], required: true },
+    // "sms" → myvfirst SMS gateway (login OTP for MMT-only vehicles)
+    service: { type: String, enum: ["wise", "mmt", "sms"], required: true },
 
     // e.g. "ValidateUser" | "ValidateOtp" | "Logout" | "OnOrOFFDuty" | ...
     endpoint: { type: String, required: true },
