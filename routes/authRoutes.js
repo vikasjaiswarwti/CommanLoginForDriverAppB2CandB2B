@@ -32,6 +32,11 @@ const {
   fetchBookingDetails,
 } = require("../controllers/bookingController");
 
+const {
+  getHelpdesk,
+  createOrUpdateHelpdesk,
+} = require("../controllers/helpdeskController");
+
 const DriverAppAuthRouter = Router(); // Create an instance of the Router
 
 // login
@@ -96,5 +101,12 @@ DriverAppAuthRouter.get("/fetch-booking-list", fetchBookingList);
 
 // booking details — ?BookingID=…&BookingType=B2B|B2C (B2B also: userid[, token, AllocationID])
 DriverAppAuthRouter.get("/fetch-booking-details", fetchBookingDetails);
+
+// helpdesk contacts ----
+
+// ?type=B2B|B2C&branch=Delhi (both optional)
+DriverAppAuthRouter.get("/get-helpdesk", getHelpdesk);
+
+DriverAppAuthRouter.post("/create-or-update/helpdesk", createOrUpdateHelpdesk);
 
 module.exports = DriverAppAuthRouter; // Export the router instance directly
