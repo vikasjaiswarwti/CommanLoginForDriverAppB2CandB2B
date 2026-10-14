@@ -22,6 +22,11 @@ const {
   createOrUpdatePermissionConfig,
 } = require("../controllers/permissionConfigController");
 
+const {
+  updateDriverOnOffStatus,
+  getDriverOnOffStatus,
+} = require("../controllers/dutyController");
+
 const DriverAppAuthRouter = Router(); // Create an instance of the Router
 
 // login
@@ -70,5 +75,14 @@ DriverAppAuthRouter.post(
   "/create-or-update/permission-config",
   createOrUpdatePermissionConfig,
 );
+
+// driver on/off duty status (Wise or MMT, same payload + response) ----
+
+DriverAppAuthRouter.post(
+  "/update-driver-on-off-status",
+  updateDriverOnOffStatus,
+);
+
+DriverAppAuthRouter.post("/get-driver-on-off-status", getDriverOnOffStatus);
 
 module.exports = DriverAppAuthRouter; // Export the router instance directly

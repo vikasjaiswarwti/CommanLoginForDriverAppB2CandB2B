@@ -4,13 +4,16 @@ const axios = require("axios");
 const DriverLoginHistory = require("../models/DriverLoginHistory");
 const time = require("./time");
 
-// Credentials that must never be persisted, even in a raw log
-const MASKED_PARAMS = ["ApiPassword"];
+// Credentials that must never be persisted, even in a raw log.
+// Matched case-insensitively (Wise uses both ApiPassword and apipassword).
+const MASKED_PARAMS = ["apipassword"];
 
-const maskParams = (params = {}) => {
+const maskParams = (params) => {
+  if (!params || typeof params !== "object") return params;
   const copy = { ...params };
-  for (const key of MASKED_PARAMS) {
-    if (copy[key] !== undefined) copy[key] = "***";
+  for (const key of Object.keys(copy)) {
+    if (MASKED_PARAMS.includes(key.toLowerCase()) && copy[key] !== undefined)
+      copy[key] = "***";
   }
   return copy;
 };
@@ -20,7 +23,7 @@ const maskParams = (params = {}) => {
 // params object that were handed to axios, and the raw status + body that
 // came back (or the axios error if nothing / a non-2xx came back).
 //
-// Pass the SAME `url` and `params` objects that were given to axios.
+// Pass the SAME `url`, `params` and `body` objects that were given to axios.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const recordExternalCall = ({
@@ -29,6 +32,7 @@ const recordExternalCall = ({
   method = "GET",
   url,
   params,
+  body,
   sentAt,
   response,
   error,
@@ -41,7 +45,8 @@ const recordExternalCall = ({
     request: {
       method,
       url,
-      params: maskParams(params),
+      params: maskParams(params) || {},
+      ...(body !== undefined ? { body: maskParams(body) } : {}),
       sentAt,
     },
     response: res

@@ -14,50 +14,7 @@ const mongoose = require("mongoose");
 // console only (see utils/loginHistoryLogger.js).
 // ─────────────────────────────────────────────────────────────────────────────
 
-const ExternalCallSchema = new mongoose.Schema(
-  {
-    service: { type: String, enum: ["wise", "mmt"], required: true },
-
-    // "ValidateUser" | "ValidateOtp" | "Logout"
-    endpoint: { type: String, required: true },
-
-    // ── What we sent ────────────────────────────────────────────────────────
-    request: {
-      method: { type: String, required: true },
-      url: { type: String, required: true },
-      // The exact params object passed to axios (only ApiPassword is masked)
-      params: { type: mongoose.Schema.Types.Mixed, default: {} },
-      sentAt: { type: Date, required: true },
-    },
-
-    // ── What we got back (null when no response arrived) ────────────────────
-    response: {
-      type: new mongoose.Schema(
-        {
-          status: { type: Number, default: null },
-          // Raw response body, exactly as returned
-          body: { type: mongoose.Schema.Types.Mixed, default: null },
-          receivedAt: { type: Date, required: true },
-        },
-        { _id: false },
-      ),
-      default: null,
-    },
-
-    // ── Transport error from axios (timeout, DNS, refused, non-2xx) ─────────
-    error: {
-      type: new mongoose.Schema(
-        {
-          code: { type: String, default: null }, // e.g. ECONNABORTED, ERR_BAD_RESPONSE
-          message: { type: String, default: null },
-        },
-        { _id: false },
-      ),
-      default: null,
-    },
-  },
-  { _id: false },
-);
+const ExternalCallSchema = require("./ExternalCallSchema");
 
 const DriverLoginHistorySchema = new mongoose.Schema(
   {
