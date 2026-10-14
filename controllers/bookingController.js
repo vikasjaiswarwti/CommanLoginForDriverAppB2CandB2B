@@ -214,4 +214,123 @@ const fetchBookingList = async (req, res) => {
   }
 };
 
-module.exports = { fetchBookingList };
+// ─────────────────────────────────────────────
+// Booking details — one booking, from the system it belongs to.
+//
+// GET /fetch-booking-details?BookingID=…&BookingType=B2B|B2C
+//     B2B also needs userid (vehicle); token / AllocationID may be passed
+//     (as for the booking list) and otherwise come from the auth record.
+//
+//   B2B → GET  {WISE_BASE_URL}/api/Chauffuer/BookingdDetailsV1
+//              ?token&BookingID&userid&AllocationID
+//   B2C → POST {MMT_BASE_URL}/0auth/Driver/getBookingDetailsByOrderNumber
+//              { order_reference_number: BookingID }
+//
+// The upstream status + body are returned unchanged (nothing is stored).
+// ─────────────────────────────────────────────
+
+// BookingType from the list ("B2B" / "B2C"); "btob" / "btoc" also accepted
+const bookingSystem = (type) => {
+  const t = String(type ?? "").toLowerCase();
+  if (t === "b2b" || t === "btob") return "b2b";
+  if (t === "b2c" || t === "btoc") return "b2c";
+  return null;
+};
+
+const fetchBookingDetails = async (req, res) => {
+  const startedAt = Date.now();
+  const { BookingID, BookingType, userid } = req.query;
+  const system = bookingSystem(BookingType);
+
+  const respond = (status, body, note = "") => {
+    const line =
+      `${time.tds()} [BOOKING-DETAIL] ← fetchBookingDetails BookingID=${BookingID ?? "-"} type=${system ?? "-"} userid=${userid ?? "-"}` +
+      ` http=${status}${note ? ` ${note}` : ""} (${Date.now() - startedAt}ms)`;
+    (status >= 500 ? console.error : status >= 400 ? console.warn : console.log)(line);
+    return res.status(status).json(body);
+  };
+
+  console.log(
+    `${time.tds()} [BOOKING-DETAIL] → fetchBookingDetails BookingID=${BookingID ?? "-"} BookingType=${BookingType ?? "-"}` +
+      ` userid=${userid ?? "-"} AllocationID=${req.query.AllocationID ?? "-"} token=${shorten(req.query.token)}`,
+  );
+
+  try {
+    if (!BookingID) {
+      return respond(400, { code: 0, Msg: "BookingID is required" });
+    }
+    if (!system) {
+      return respond(400, { code: 0, Msg: 'BookingType must be "B2B" or "B2C"' });
+    }
+
+    // ── B2C → MMT ────────────────────────────────────────────────────────────
+    if (system === "b2c") {
+      const url = `${process.env.MMT_BASE_URL}/0auth/Driver/getBookingDetailsByOrderNumber`;
+      const body = { order_reference_number: BookingID };
+      console.log(`${time.tds()} [BOOKING-DETAIL] MMT getBookingDetailsByOrderNumber called, order_reference_number=${BookingID}`);
+
+      const response = await axios.post(url, body, {
+        timeout: Number(process.env.MMT_TIMEOUT_MS) || TIMEOUT_MS,
+        validateStatus: () => true, // relay MMT's own status (404 etc.)
+      });
+      return respond(response.status, response.data, "source=mmt");
+    }
+
+    // ── B2B → Wise ───────────────────────────────────────────────────────────
+    let { token, AllocationID } = req.query;
+
+    // userid (vehicle number) is always needed: Wise takes it as a param, and
+    // it is the key to the driver's session (token / AllocationID) on the
+    // auth record when the app does not send them.
+    if (!userid) {
+      return respond(400, {
+        code: 0,
+        Msg: "userid (vehicle number) is required for B2B bookings",
+      });
+    }
+
+    if (!token || !AllocationID) {
+      const authRecord = await AuthModelForCommonDApp.findOne({
+        vehicleNumber: normalize(userid),
+      }).sort({ createdAt: -1 });
+
+      token = token || authRecord?.wiseToken;
+      AllocationID = AllocationID || authRecord?.wiseAllocationId;
+      console.log(
+        `${time.tds()} [BOOKING-DETAIL] Wise session from auth record for userid=${userid}: ${authRecord ? "found" : "NOT FOUND"}, token=${shorten(token)}, AllocationID=${AllocationID ?? "-"}`,
+      );
+
+      if (!token || !AllocationID) {
+        return respond(404, { code: 0, Msg: "No active B2B session for this vehicle" });
+      }
+    }
+
+    const url = `${process.env.WISE_BASE_URL}/api/Chauffuer/BookingdDetailsV1`;
+    const params = { token, BookingID, userid, AllocationID };
+    console.log(
+      `${time.tds()} [BOOKING-DETAIL] WISE BookingdDetailsV1 called, BookingID=${BookingID}, userid=${userid ?? "-"}, AllocationID=${AllocationID}`,
+    );
+
+    const response = await axios.get(url, {
+      params,
+      timeout: TIMEOUT_MS,
+      validateStatus: () => true, // relay Wise's own status
+    });
+    return respond(
+      response.status,
+      response.data,
+      `source=wise code=${response.data?.code ?? response.data?.Code ?? "-"}`,
+    );
+  } catch (error) {
+    const timedOut = error.code === "ECONNABORTED";
+    console.error(
+      `${time.tds()} [BOOKING-DETAIL] fetchBookingDetails FAILED for BookingID=${BookingID}: code=${error.code ?? "-"}, msg=${error.message}`,
+    );
+    return respond(timedOut ? 504 : 502, {
+      code: 0,
+      Msg: timedOut ? "Booking service timed out" : "Unable to fetch booking details",
+    });
+  }
+};
+
+module.exports = { fetchBookingList, fetchBookingDetails };
