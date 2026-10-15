@@ -103,12 +103,12 @@ DriverAppAuthRouter.post("/get-driver-on-off-status", getDriverOnOffStatus);
 // Same query as Wise BookingList: AllocationID, Gcm, Month, CabId, userid, token
 DriverAppAuthRouter.get("/fetch-booking-list", fetchBookingList);
 
-// booking details — ?BookingID=…&BookingType=B2B|B2C (B2B also: userid[, token, AllocationID])
+// booking details — ?BookingID=…&BookingType=B2B|B2C&userid=…&token=…[&AllocationID]
 DriverAppAuthRouter.get("/fetch-booking-details", fetchBookingDetails);
 
 // helpdesk contacts ----
 
-// ?type=B2B|B2C&branch=Delhi (both optional)
+// ?userid=…&token=… (required) &type=B2B|B2C&branch=Delhi (optional)
 DriverAppAuthRouter.get("/get-helpdesk", getHelpdesk);
 
 DriverAppAuthRouter.post("/create-or-update/helpdesk", createOrUpdateHelpdesk);

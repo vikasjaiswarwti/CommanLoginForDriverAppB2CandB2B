@@ -21,6 +21,12 @@
 const axios = require("axios");
 const AuthModelForCommonDApp = require("../models/AuthModelForCommonDApp");
 const time = require("../utils/time");
+const {
+  UNAUTHORIZED_MESSAGE,
+  shorten,
+  checkSessionToken,
+  verifyDriverSession,
+} = require("../utils/sessionAuth");
 
 const TIMEOUT_MS = 5000;
 
@@ -113,24 +119,6 @@ const fetchMmtBookings = async (vehicle, month) => {
 // Handler
 // ─────────────────────────────────────────────
 
-// Long secrets → first/last 6 chars only, for console logs
-const shorten = (v) =>
-  v == null ? "-" : String(v).length > 16 ? `${String(v).slice(0, 6)}…${String(v).slice(-6)}` : String(v);
-
-// The driver's current session token on the auth record — the same single
-// effective token login returns: B2B (Wise) token when the vehicle is in B2B,
-// otherwise the B2C (MMT) token. Logout clears b2b.token / b2c.token (but NOT
-// wiseToken), so wiseToken is deliberately not used — a logged-out driver
-// must get 401.
-const currentSessionToken = (authRecord) =>
-  (authRecord.b2b?.exist && authRecord.b2b?.token) ||
-  authRecord.b2c?.token ||
-  null;
-
-// Plain string comparison; missing on either side never matches
-const tokensMatch = (sent, expected) =>
-  !!sent && !!expected && String(sent) === String(expected);
-
 const fetchBookingList = async (req, res) => {
   const startedAt = Date.now();
   const tag = `${time.tds()} [BOOKING]`;
@@ -176,16 +164,10 @@ const fetchBookingList = async (req, res) => {
     // Same single effective token login returns: B2B (Wise) wins, else B2C.
     // Missing / mismatched (logged out, or logged in on another device) → 401
     // so the app logs the driver out.
-    const expectedToken = currentSessionToken(authRecord);
-    if (!tokensMatch(token, expectedToken)) {
-      console.warn(
-        `${time.tds()} [BOOKING] 401 for vehicle=${vehicle}: token ${!token ? "missing in request" : !expectedToken ? "sent but no active session in DB" : "does not match DB"} (sent=${shorten(token)}, db=${shorten(expectedToken)})`,
-      );
-      return respond(401, {
-        code: 0,
-        Msg: "Unauthorized: session expired or invalid. Please login again.",
-        BookingList: [],
-      });
+    const session = checkSessionToken(authRecord, token);
+    if (!session.ok) {
+      console.warn(`${time.tds()} [BOOKING] 401 for vehicle=${vehicle}: ${session.log}`);
+      return respond(401, { code: 0, Msg: UNAUTHORIZED_MESSAGE, BookingList: [] });
     }
     console.log(`${time.tds()} [BOOKING] token verified for vehicle=${vehicle}`);
 
@@ -248,9 +230,9 @@ const fetchBookingList = async (req, res) => {
 // ─────────────────────────────────────────────
 // Booking details — one booking, from the system it belongs to.
 //
-// GET /fetch-booking-details?BookingID=…&BookingType=B2B|B2C
-//     B2B also needs userid (vehicle); token / AllocationID may be passed
-//     (as for the booking list) and otherwise come from the auth record.
+// GET /fetch-booking-details?BookingID=…&BookingType=B2B|B2C&userid=…&token=…
+//     userid + token are required and checked against the auth record (401 on
+//     mismatch). B2B: AllocationID may be passed, else taken from the record.
 //
 //   B2B → GET  {WISE_BASE_URL}/api/Chauffuer/BookingdDetailsV1
 //              ?token&BookingID&userid&AllocationID
@@ -293,6 +275,18 @@ const fetchBookingDetails = async (req, res) => {
     if (!system) {
       return respond(400, { code: 0, Msg: 'BookingType must be "B2B" or "B2C"' });
     }
+    if (!userid) {
+      return respond(400, { code: 0, Msg: "userid (vehicle number) is required" });
+    }
+
+    // ── Session check — app's token must be the driver's current token ──────
+    const session = await verifyDriverSession(userid, req.query.token);
+    if (!session.ok) {
+      console.warn(`${time.tds()} [BOOKING-DETAIL] 401 for userid=${userid}: ${session.log}`);
+      return respond(401, { code: 0, Msg: UNAUTHORIZED_MESSAGE });
+    }
+    const { authRecord } = session;
+    console.log(`${time.tds()} [BOOKING-DETAIL] token verified for userid=${userid}`);
 
     // ── B2C → MMT ────────────────────────────────────────────────────────────
     if (system === "b2c") {
@@ -308,32 +302,12 @@ const fetchBookingDetails = async (req, res) => {
     }
 
     // ── B2B → Wise ───────────────────────────────────────────────────────────
-    let { token, AllocationID } = req.query;
-
-    // userid (vehicle number) is always needed: Wise takes it as a param, and
-    // it is the key to the driver's session (token / AllocationID) on the
-    // auth record when the app does not send them.
-    if (!userid) {
-      return respond(400, {
-        code: 0,
-        Msg: "userid (vehicle number) is required for B2B bookings",
-      });
-    }
-
-    if (!token || !AllocationID) {
-      const authRecord = await AuthModelForCommonDApp.findOne({
-        vehicleNumber: normalize(userid),
-      }).sort({ createdAt: -1 });
-
-      token = token || authRecord?.wiseToken;
-      AllocationID = AllocationID || authRecord?.wiseAllocationId;
-      console.log(
-        `${time.tds()} [BOOKING-DETAIL] Wise session from auth record for userid=${userid}: ${authRecord ? "found" : "NOT FOUND"}, token=${shorten(token)}, AllocationID=${AllocationID ?? "-"}`,
-      );
-
-      if (!token || !AllocationID) {
-        return respond(404, { code: 0, Msg: "No active B2B session for this vehicle" });
-      }
+    // Token is the verified session token; AllocationID from the app or the
+    // auth record.
+    const token = req.query.token;
+    const AllocationID = req.query.AllocationID || authRecord.wiseAllocationId;
+    if (!AllocationID) {
+      return respond(404, { code: 0, Msg: "No active B2B session for this vehicle" });
     }
 
     const url = `${process.env.WISE_BASE_URL}/api/Chauffuer/BookingdDetailsV1`;

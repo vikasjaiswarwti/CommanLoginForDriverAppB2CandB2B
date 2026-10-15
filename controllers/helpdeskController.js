@@ -2,6 +2,11 @@
 
 const Helpdesk = require("../models/Helpdesk");
 const { HELPDESK_COLLATION } = require("../models/Helpdesk");
+const time = require("../utils/time");
+const {
+  UNAUTHORIZED_MESSAGE,
+  verifyDriverSession,
+} = require("../utils/sessionAuth");
 
 // ─────────────────────────────────────────────
 // Helpdesk endpoints
@@ -15,10 +20,25 @@ const toType = (value) => {
   return null;
 };
 
-// GET /get-helpdesk?type=B2B&branch=Delhi  (both filters optional)
+// GET /get-helpdesk?userid=…&token=…&type=B2B&branch=Delhi
+//   userid + token required (driver session check, 401 on mismatch);
+//   type and branch are optional filters
 const getHelpdesk = async (req, res) => {
   try {
-    const { type, branch } = req.query;
+    const { type, branch, userid, token } = req.query;
+
+    if (!userid) {
+      return res
+        .status(400)
+        .json({ success: false, message: "userid (vehicle number) is required" });
+    }
+
+    // Session check — app's token must be the driver's current token
+    const session = await verifyDriverSession(userid, token);
+    if (!session.ok) {
+      console.warn(`${time.tds()} [HELPDESK] 401 for userid=${userid}: ${session.log}`);
+      return res.status(401).json({ success: false, message: UNAUTHORIZED_MESSAGE });
+    }
 
     const filter = { isActive: true };
     if (type !== undefined) {

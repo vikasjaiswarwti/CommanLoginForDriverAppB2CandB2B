@@ -3,8 +3,9 @@
 // Common Driver On/Off status API. Payloads and responses are identical to the
 // MMT (B2C) "Driver On/Off Status API", whichever system the vehicle lives in:
 //
-//   update : { VehicleNumber, driveronoffstatus: boolean }
-//   get    : { VehicleNumber }
+//   update : { VehicleNumber, driveronoffstatus: boolean, token }
+//   get    : { VehicleNumber, token }
+//   401    : { message }   token missing / not the driver's current session
 //   200    : { VehicleNumber, Driverid, driveronoffstatus }
 //   errors : { message }   (400 / 404 / 500, same messages as MMT)
 //
@@ -23,6 +24,11 @@ const AuthModelForCommonDApp = require("../models/AuthModelForCommonDApp");
 const DriverDutyHistory = require("../models/DriverDutyHistory");
 const { recordExternalCall } = require("../utils/loginHistoryLogger");
 const time = require("../utils/time");
+const {
+  UNAUTHORIZED_MESSAGE,
+  shorten,
+  checkSessionToken,
+} = require("../utils/sessionAuth");
 
 const TIMEOUT_MS = 5000;
 
@@ -51,7 +57,12 @@ const startDutyLog = (req, action) => {
         vehicleNumber: rawVehicle ? normalize(rawVehicle) : "unknown",
         authRecordId: log.authRecordId,
         action,
-        appRequest: { body: req.body ?? {} },
+        // session token is stored shortened, never in full
+        appRequest: {
+          body: req.body?.token
+            ? { ...req.body, token: shorten(req.body.token) }
+            : (req.body ?? {}),
+        },
         externalCalls: log.calls,
         appResponse: { status, body: body ?? null },
       }).catch((err) =>
@@ -206,6 +217,13 @@ const updateDriverOnOffStatus = async (req, res) => {
     }
     const { inWise, inMmt, authRecord } = resolved;
     log.authRecordId = authRecord._id;
+
+    // Session check — app's token must be the driver's current token
+    const session = checkSessionToken(authRecord, req.body.token);
+    if (!session.ok) {
+      console.warn(`${time.tds()} [DUTY] 401 for vehicle=${normalizedVehicle}: ${session.log}`);
+      return log.send(res, 401, { message: UNAUTHORIZED_MESSAGE });
+    }
     const mmtBody = { VehicleNumber: normalizedVehicle, driveronoffstatus };
     const mmtPath = "/0auth/Driver/updateDriverOnOffStatus";
 
@@ -271,6 +289,13 @@ const getDriverOnOffStatus = async (req, res) => {
     }
     const { inWise, inMmt, authRecord } = resolved;
     log.authRecordId = authRecord._id;
+
+    // Session check — app's token must be the driver's current token
+    const session = checkSessionToken(authRecord, req.body.token);
+    if (!session.ok) {
+      console.warn(`${time.tds()} [DUTY] 401 for vehicle=${normalizedVehicle}: ${session.log}`);
+      return log.send(res, 401, { message: UNAUTHORIZED_MESSAGE });
+    }
     const mmtBody = { VehicleNumber: normalizedVehicle };
     const mmtPath = "/0auth/Driver/getDriverOnOffStatus";
 
