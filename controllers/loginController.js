@@ -1106,7 +1106,9 @@ const logoutDriverFromWiseService = async (
 
 const logoutCommonForDriver = async (req, res) => {
   try {
-    const { vehicleNumber, wiseToken, wiseUserId, wiseAllocationId } = req.body;
+    // Only the vehicle number is taken from the app — every Wise session value
+    // (token, userid, AllocationID) comes from the auth record in our DB.
+    const { vehicleNumber } = req.body;
 
     if (!vehicleNumber?.trim()) {
       return res
@@ -1155,14 +1157,21 @@ const logoutCommonForDriver = async (req, res) => {
     let wiseLogoutResult = null;
 
     // ── Wise (B2B) logout — only when a Wise session is actually active ──────
-    // wiseToken/wiseUserId/wiseAllocationId can be passed in by the caller
-    // (e.g. the app's current in-memory session values); anything not
-    // passed falls back to what's stored on the auth record.
+    // Session values come only from the auth record (saved at OTP
+    // verification); nothing from the request body is used.
     if (wasLoggedIntoWise) {
+      const wiseToken = authRecord.wiseToken || authRecord.b2b.token;
+      const wiseUserId = authRecord.wiseUserId || normalizedVehicle;
+      const wiseAllocationId = authRecord.wiseAllocationId;
+
+      console.log(
+        `${time.tds()} [OTP-SERVICE] logoutCommonForDriver: Wise session from DB for vehicle=${normalizedVehicle}: userid=${wiseUserId}, AllocationID=${wiseAllocationId ?? "-"}, token=${wiseToken ? "present" : "MISSING"}`,
+      );
+
       wiseLogoutResult = await logoutDriverFromWiseService(
-        wiseToken || authRecord.wiseToken,
-        wiseUserId || authRecord.wiseUserId || normalizedVehicle,
-        wiseAllocationId || authRecord.wiseAllocationId,
+        wiseToken,
+        wiseUserId,
+        wiseAllocationId,
       );
 
       authRecord.b2b.verified = false;
