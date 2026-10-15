@@ -117,6 +117,20 @@ const fetchMmtBookings = async (vehicle, month) => {
 const shorten = (v) =>
   v == null ? "-" : String(v).length > 16 ? `${String(v).slice(0, 6)}…${String(v).slice(-6)}` : String(v);
 
+// The driver's current session token on the auth record — the same single
+// effective token login returns: B2B (Wise) token when the vehicle is in B2B,
+// otherwise the B2C (MMT) token. Logout clears b2b.token / b2c.token (but NOT
+// wiseToken), so wiseToken is deliberately not used — a logged-out driver
+// must get 401.
+const currentSessionToken = (authRecord) =>
+  (authRecord.b2b?.exist && authRecord.b2b?.token) ||
+  authRecord.b2c?.token ||
+  null;
+
+// Plain string comparison; missing on either side never matches
+const tokensMatch = (sent, expected) =>
+  !!sent && !!expected && String(sent) === String(expected);
+
 const fetchBookingList = async (req, res) => {
   const startedAt = Date.now();
   const tag = `${time.tds()} [BOOKING]`;
@@ -157,6 +171,23 @@ const fetchBookingList = async (req, res) => {
     if (!authRecord || (!inWise && !inMmt)) {
       return respond(404, { code: 0, Msg: "Vehicle not found", BookingList: [] });
     }
+
+    // ── Session check — app's token must be the driver's current token ──────
+    // Same single effective token login returns: B2B (Wise) wins, else B2C.
+    // Missing / mismatched (logged out, or logged in on another device) → 401
+    // so the app logs the driver out.
+    const expectedToken = currentSessionToken(authRecord);
+    if (!tokensMatch(token, expectedToken)) {
+      console.warn(
+        `${time.tds()} [BOOKING] 401 for vehicle=${vehicle}: token ${!token ? "missing in request" : !expectedToken ? "sent but no active session in DB" : "does not match DB"} (sent=${shorten(token)}, db=${shorten(expectedToken)})`,
+      );
+      return respond(401, {
+        code: 0,
+        Msg: "Unauthorized: session expired or invalid. Please login again.",
+        BookingList: [],
+      });
+    }
+    console.log(`${time.tds()} [BOOKING] token verified for vehicle=${vehicle}`);
 
     const month = Number(Month) || null;
     console.log(
