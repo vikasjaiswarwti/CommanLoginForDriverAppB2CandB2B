@@ -4,6 +4,7 @@ const {
   checkWhenToSwitchToB2BApp,
   createOrUpdateConfig,
   loginCommonForDriver,
+  resendOtpCommonForDriver,
   getCommanAuthDetailOnEveryHit,
   logoutCommonForDriver,
 } = require("../controllers/loginController");
@@ -52,6 +53,9 @@ DriverAppAuthRouter.post(
 
 // login api
 DriverAppAuthRouter.post("/login-common-driver", loginCommonForDriver);
+
+// resend otp api — same payload as login, works for Wise / MMT / both
+DriverAppAuthRouter.post("/resend-common-otp", resendOtpCommonForDriver);
 
 // logout api
 DriverAppAuthRouter.post("/logout-common-driver", logoutCommonForDriver);

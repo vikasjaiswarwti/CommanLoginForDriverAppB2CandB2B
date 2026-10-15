@@ -43,6 +43,8 @@ const DriverLoginHistorySchema = new mongoose.Schema(
     //   auto_login_failed  → autoLoginToB2BIfExistInMMT failed
     //   logout             → common logout API called, session(s) closed
     //   logout_failed      → common logout API failed
+    //   otp_resent         → resend OTP API issued a fresh OTP
+    //   otp_resend_failed  → resend OTP API refused or failed
     action: {
       type: String,
       enum: [
@@ -55,6 +57,8 @@ const DriverLoginHistorySchema = new mongoose.Schema(
         "auto_login_failed",
         "logout",
         "logout_failed",
+        "otp_resent",
+        "otp_resend_failed",
       ],
       required: true,
     },

@@ -70,6 +70,11 @@ const createOrUpdateConfig = async (req, res) => {
 const loginCommonForDriver = async (req, res) => {
   const externalCalls = [];
   let authRecordId = null;
+  // Set by resendOtpCommonForDriver — same flow, logged / worded as a resend
+  const isResend = req.otpResend === true;
+  const successAction = isResend ? "otp_resent" : "login_initiated";
+  const failAction = isResend ? "otp_resend_failed" : "login_failed";
+  const successMessage = isResend ? "OTP resent successfully" : "Driver login flow initiated";
   try {
     const { vehicleNumber, gcm } = req.body;
 
@@ -86,7 +91,7 @@ const loginCommonForDriver = async (req, res) => {
     // checking existence, so we must know its outcome before deciding whether
     // MMT should generate/send a second, competing OTP.
     console.log(
-      `${time.tds()} [OTP-SERVICE] loginCommonForDriver: calling WISE OTP service (ValidateUser) for vehicle=${normalizedVehicle}`,
+      `${time.tds()} [OTP-SERVICE] loginCommonForDriver (flow=${isResend ? "resend" : "login"}): calling WISE OTP service (ValidateUser) for vehicle=${normalizedVehicle}`,
     );
     const wiseResult = await loginDriverForWiseService(
       normalizedVehicle,
@@ -124,7 +129,7 @@ const loginCommonForDriver = async (req, res) => {
     // OTP wins. For an MMT-only vehicle this service texts the MMT OTP itself
     // (STEP 3) — the driver gets exactly one SMS either way.
     console.log(
-      `${time.tds()} [OTP-SERVICE] loginCommonForDriver: calling MMT OTP service for vehicle=${normalizedVehicle}, skipSms=true`,
+      `${time.tds()} [OTP-SERVICE] loginCommonForDriver (flow=${isResend ? "resend" : "login"}): calling MMT OTP service for vehicle=${normalizedVehicle}, skipSms=true`,
     );
     const mmtResult = await loginDriverForMMTService(normalizedVehicle).catch(
       (err) => ({ __rejected: true, err }),
@@ -145,7 +150,7 @@ const loginCommonForDriver = async (req, res) => {
     const failLogin = async (httpStatus, code, message) => {
       await logLoginEvent(req, {
         vehicleNumber: normalizedVehicle,
-        action: "login_failed",
+        action: failAction,
         status: "failure",
         source: existInMmt ? (existInWise ? "both" : "mmt") : existInWise ? "wise" : "none",
         httpStatus,
@@ -347,11 +352,11 @@ const loginCommonForDriver = async (req, res) => {
     await logLoginEvent(req, {
       vehicleNumber: normalizedVehicle,
       authRecordId,
-      action: "login_initiated",
+      action: successAction,
       status: "success",
       source: existInMmt ? (existInWise ? "both" : "mmt") : "wise",
       httpStatus: 200,
-      message: "Driver login flow initiated",
+      message: successMessage,
       externalCalls,
       details: {
         b2cExists: existInMmt,
@@ -370,7 +375,7 @@ const loginCommonForDriver = async (req, res) => {
       existInWise,
       vehicleId: mmtData.vehicleId || null,
       driverContact: authRecord.driverContact ?? null,
-      message: "Driver login flow initiated",
+      message: successMessage,
       driverSource: existInMmt ? "mmt" : "wise",
       useWiseOtp: wiseFlowActive,
     };
@@ -405,7 +410,7 @@ const loginCommonForDriver = async (req, res) => {
     await logLoginEvent(req, {
       vehicleNumber: normalizeVehicle(req.body?.vehicleNumber),
       authRecordId,
-      action: "login_failed",
+      action: failAction,
       status: "failure",
       httpStatus: 500,
       errorCode: "INTERNAL_ERROR",
@@ -415,6 +420,124 @@ const loginCommonForDriver = async (req, res) => {
     return res
       .status(500)
       .json({ success: false, message: "Internal Server Error" });
+  }
+};
+
+// ─────────────────────────────────────────────
+// Common resend OTP
+//
+// POST /resend-common-otp { vehicleNumber, gcm? }  — same payload as login.
+//
+// Only allowed while a login is in progress (an OTP was issued and not yet
+// verified) and at most once per OTP_RESEND_COOLDOWN_SECONDS (default 30).
+// It then re-runs loginCommonForDriver, so routing is identical to login:
+//   Wise vehicle  → Wise ValidateUser issues + texts a fresh OTP
+//   MMT only      → MMT loginDriver issues a fresh OTP, we text it
+// The new OTP replaces the old one (otpTracking, attempts reset). The response
+// has the same shape as login; history logs otp_resent / otp_resend_failed.
+// ─────────────────────────────────────────────
+
+const resendOtpCommonForDriver = async (req, res) => {
+  const startedAt = Date.now();
+  const vehicleNumber = req.body?.vehicleNumber;
+  const normalizedVehicle = normalizeVehicle(vehicleNumber);
+  const TAG = "[OTP-RESEND]";
+  // Long values (gcm) → first/last 6 chars only
+  const short = (v) =>
+    !v ? "-" : String(v).length > 16 ? `${String(v).slice(0, 6)}…${String(v).slice(-6)}` : String(v);
+
+  // Final line for EVERY outcome — guards below and the delegated login flow
+  if (typeof res.on === "function") {
+    res.on("finish", () => {
+      const line = `${time.tds()} ${TAG} ← resend finished for vehicle=${normalizedVehicle ?? "-"}: http=${res.statusCode} (${Date.now() - startedAt}ms)`;
+      (res.statusCode >= 500 ? console.error : res.statusCode >= 400 ? console.warn : console.log)(line);
+    });
+  }
+
+  const refuse = async (httpStatus, code, message, authRecordId = null, extra = {}) => {
+    console.warn(`${time.tds()} ${TAG} refused for vehicle=${normalizedVehicle}: ${code} — ${message}`);
+    await logLoginEvent(req, {
+      vehicleNumber: normalizedVehicle,
+      authRecordId,
+      action: "otp_resend_failed",
+      status: "failure",
+      source: "none",
+      httpStatus,
+      errorCode: code,
+      message,
+    });
+    return res.status(httpStatus).json({ success: false, code, message, ...extra });
+  };
+
+  console.log(
+    `${time.tds()} ${TAG} → resend requested: vehicleNumber=${vehicleNumber ?? "-"} (normalized=${normalizedVehicle ?? "-"}), gcm=${short(req.body?.gcm)}`,
+  );
+
+  try {
+    if (!vehicleNumber?.trim()) {
+      console.warn(`${time.tds()} ${TAG} refused: vehicleNumber missing in request body`);
+      return res
+        .status(400)
+        .json({ success: false, message: "Vehicle number is required" });
+    }
+
+    const authRecord = await AuthModelForCommonDApp.findOne({
+      vehicleNumber: normalizedVehicle,
+    }).sort({ createdAt: -1 });
+
+    const otp = authRecord?.otpTracking;
+    const loginInProgress = !!(otp && (otp.code || otp.pending));
+    const ageSec = otp?.generatedAt
+      ? Math.floor((Date.now() - new Date(otp.generatedAt).getTime()) / 1000)
+      : null;
+    const expired = otp?.expiresAt ? new Date() > new Date(otp.expiresAt) : null;
+
+    console.log(
+      `${time.tds()} ${TAG} auth record for vehicle=${normalizedVehicle}: ${authRecord ? `found (${authRecord._id})` : "NOT FOUND"}` +
+        (authRecord
+          ? `, b2b.exist=${!!authRecord.b2b?.exist}, b2c.exist=${!!authRecord.b2c?.exist}` +
+            `, otp: source=${otp?.source ?? "-"}, active=${loginInProgress}, issued=${ageSec ?? "-"}s ago, expired=${expired ?? "-"}, wrongAttempts=${otp?.attempts ?? 0}`
+          : ""),
+    );
+
+    if (!authRecord || !loginInProgress) {
+      return refuse(
+        400,
+        "NO_LOGIN_IN_PROGRESS",
+        "No login in progress for this vehicle. Please login first.",
+        authRecord?._id,
+      );
+    }
+
+    const cooldownSec = Number(process.env.OTP_RESEND_COOLDOWN_SECONDS) || 30;
+    const elapsedSec = otp.generatedAt
+      ? (Date.now() - new Date(otp.generatedAt).getTime()) / 1000
+      : Infinity;
+
+    if (elapsedSec < cooldownSec) {
+      const retryAfterSeconds = Math.ceil(cooldownSec - elapsedSec);
+      return refuse(
+        429,
+        "OTP_RESEND_TOO_SOON",
+        `Please wait ${retryAfterSeconds} seconds before requesting a new OTP.`,
+        authRecord._id,
+        { retryAfterSeconds },
+      );
+    }
+
+    // Keep the device's gcm if the app does not send it again
+    const gcmSource = req.body.gcm ? "request" : authRecord.wiseGcm ? "auth record" : "none";
+    req.body.gcm = req.body.gcm || authRecord.wiseGcm || undefined;
+    req.otpResend = true;
+
+    console.log(
+      `${time.tds()} ${TAG} checks passed for vehicle=${normalizedVehicle} (cooldown ${cooldownSec}s, last OTP ${Math.floor(elapsedSec)}s ago); gcm from ${gcmSource}=${short(req.body.gcm)} → running login flow to issue a fresh OTP`,
+    );
+
+    return loginCommonForDriver(req, res);
+  } catch (err) {
+    console.error(`${time.tds()} ${TAG} error for vehicle=${normalizedVehicle}:`, err.stack || err.message);
+    return refuse(500, "INTERNAL_ERROR", "Internal Server Error");
   }
 };
 
@@ -1106,6 +1229,7 @@ const logoutCommonForDriver = async (req, res) => {
 
 module.exports = {
   loginCommonForDriver,
+  resendOtpCommonForDriver,
   checkWhenToSwitchToB2BApp,
   createOrUpdateConfig,
 
