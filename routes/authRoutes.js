@@ -38,6 +38,11 @@ const {
   createOrUpdateHelpdesk,
 } = require("../controllers/helpdeskController");
 
+const {
+  getDeviceHealth,
+  getDeviceHealthBookings,
+} = require("../controllers/deviceHealthController");
+
 const DriverAppAuthRouter = Router(); // Create an instance of the Router
 
 // login
@@ -112,5 +117,13 @@ DriverAppAuthRouter.get("/fetch-booking-details", fetchBookingDetails);
 DriverAppAuthRouter.get("/get-helpdesk", getHelpdesk);
 
 DriverAppAuthRouter.post("/create-or-update/helpdesk", createOrUpdateHelpdesk);
+
+// device health during a booking (read-only, from wischauffeur.TrackLocation) ----
+// ?BookingType=B2B|B2C&BookingID=…[&cursor=…][&from=…&to=…] — 20 per page, no polling
+DriverAppAuthRouter.get("/device-health", getDeviceHealth);
+
+// bookings with tracking data on a day (B2B / B2C tabs)
+// ?BookingType=B2B|B2C[&date=YYYY-MM-DD (IST, default today)][&cursor=…] — 20 per page
+DriverAppAuthRouter.get("/device-health/bookings", getDeviceHealthBookings);
 
 module.exports = DriverAppAuthRouter; // Export the router instance directly
