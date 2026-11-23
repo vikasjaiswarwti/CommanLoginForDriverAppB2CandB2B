@@ -45,6 +45,8 @@ const DriverLoginHistorySchema = new mongoose.Schema(
     //   logout_failed      → common logout API failed
     //   otp_resent         → resend OTP API issued a fresh OTP
     //   otp_resend_failed  → resend OTP API refused or failed
+    //   profile_success    → /get-driver-vehicle-profile served
+    //   profile_failed     → /get-driver-vehicle-profile refused or failed
     action: {
       type: String,
       enum: [
@@ -59,6 +61,8 @@ const DriverLoginHistorySchema = new mongoose.Schema(
         "logout_failed",
         "otp_resent",
         "otp_resend_failed",
+        "profile_success",
+        "profile_failed",
       ],
       required: true,
     },

@@ -43,6 +43,10 @@ const {
   getDeviceHealthBookings,
 } = require("../controllers/deviceHealthController");
 
+const {
+  getDriverVehicleProfile,
+} = require("../controllers/profileController");
+
 const DriverAppAuthRouter = Router(); // Create an instance of the Router
 
 // login
@@ -117,6 +121,10 @@ DriverAppAuthRouter.get("/fetch-booking-details", fetchBookingDetails);
 DriverAppAuthRouter.get("/get-helpdesk", getHelpdesk);
 
 DriverAppAuthRouter.post("/create-or-update/helpdesk", createOrUpdateHelpdesk);
+
+// vehicle + driver profile with document expiry (Wise + MMT) ----
+// ?userid=<vehicle>&token=<session token>
+DriverAppAuthRouter.get("/get-driver-vehicle-profile", getDriverVehicleProfile);
 
 // device health during a booking (read-only, from wischauffeur.TrackLocation) ----
 // ?BookingType=B2B|B2C&BookingID=…[&cursor=…][&from=…&to=…] — 20 per page, no polling
